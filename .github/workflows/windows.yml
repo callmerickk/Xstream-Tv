@@ -11,6 +11,17 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
+    # Two native builds every time: x64 (Intel / AMD) and ARM64 (Snapdragon). ARM64 is cross-compiled, no emulation.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            triplet: x64-windows
+            mpv: x86_64
+          - arch: ARM64
+            triplet: arm64-windows
+            mpv: aarch64
     env:
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
     steps:
@@ -19,12 +30,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ hashFiles('vcpkg.json') }}-v1
+          key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}-v1
       - name: Build
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force vcpkg-cache, out | Out-Null
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows 2>&1 | Tee-Object out/build.log
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }} -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} 2>&1 | Tee-Object out/build.log
           cmake --build build --config Release -- /m /v:minimal 2>&1 | Tee-Object -Append out/build.log
           if (!(Test-Path build/Release/xstream.exe)) { exit 1 }
       - name: Add the video engine (libmpv, LGPL build)
@@ -34,31 +45,45 @@ jobs:
         run: |
           names=$(gh release view -R zhongfly/mpv-winbuild --json assets -q '.assets[].name')
           echo "$names" > out/mpv-assets.txt
-          pick=$(echo "$names" | grep -E '^mpv-dev-lgpl-x86_64-[0-9]' | head -1)
-          [ -z "$pick" ] && pick=$(echo "$names" | grep -E '^mpv-dev-x86_64-[0-9]' | head -1)
+          pick=$(echo "$names" | grep -E '^mpv-dev-lgpl-${{ matrix.mpv }}-[0-9]' | head -1)
+          [ -z "$pick" ] && pick=$(echo "$names" | grep -E '^mpv-dev-${{ matrix.mpv }}-[0-9]' | head -1)
           echo "using $pick" | tee -a out/build.log
           gh release download -R zhongfly/mpv-winbuild -p "$pick" -D mpv
           7z x -y -ompv mpv/*.7z > /dev/null
+          [ -z "$pick" ] && { echo "no libmpv for ${{ matrix.mpv }}"; exit 1; }
           cp mpv/libmpv-2.dll build/Release/ || find mpv -name "*.dll" | tee -a out/build.log
       - name: Package
         shell: pwsh
         run: |
           Copy-Item README.md build/Release/
-          Compress-Archive -Path build/Release/* -DestinationPath out/Xstream-TV-windows.zip -Force
+          Compress-Archive -Path build/Release/* -DestinationPath out/Xstream-TV-windows-${{ matrix.mpv == 'aarch64' && 'arm64' || 'x64' }}.zip -Force
           Get-ChildItem build/Release | Format-Table Name, Length | Out-String | Add-Content out/build.log
-      - name: Publish release
-        if: github.event.inputs.publish == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="win-${{ github.run_number }}"
-          gh release create "$tag" out/Xstream-TV-windows.zip --title "Xstream TV for Windows (build ${{ github.run_number }})" --notes-file RELEASE_NOTES.md --latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.arch }}
+          path: out/*.zip
       - name: Save logs to the ci-windows branch
         if: always()
         shell: bash
         run: |
           cd out && rm -f *.zip
-          git init -q && git checkout -q -b ci-windows
+          git init -q && git checkout -q -b ci-windows-${{ matrix.arch }}
           git add -A && git -c user.name=ci -c user.email=ci@local commit -qm "run ${{ github.run_number }} (${{ github.sha }})"
-          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-windows
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-windows-${{ matrix.arch }}
+  publish:
+    needs: build
+    if: github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release (Intel/AMD x64 + ARM64 Snapdragon)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          tag="win-${{ github.run_number }}"
+          gh release create "$tag" dist/*.zip --title "Xstream TV for Windows (build ${{ github.run_number }})" --notes-file RELEASE_NOTES.md --latest
