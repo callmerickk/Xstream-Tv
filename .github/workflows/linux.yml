@@ -36,6 +36,13 @@ jobs:
           S="${SCRIPT:-14:SHOT=out/shots/1-home.png;15:DOWN;16:DOWN;17:RIGHT;18:SHOT=out/shots/2-home-rows.png;19:DOWN;20:DOWN;22:SHOT=out/shots/3-home-scrolled.png;23:OK;29:SHOT=out/shots/4-detail.png;30:BACK;31:SEARCH;32:TEXT=batman;38:SHOT=out/shots/5-search.png;39:QUIT}"
           cd build && timeout 150 xvfb-run -a -s "-screen 0 1280x720x24" gdb -q -batch -ex run -ex bt -ex "info locals" --args ./xstream --script "$(echo "$S" | sed 's#out/#../out/#g')" > ../out/run.log 2>&1 || echo "exit $?" >> ../out/run.log
           tail -40 ../out/run.log
+      - name: Player test
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          XE_TEST_URL: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        run: |
+          cd build && timeout 90 xvfb-run -a -s "-screen 0 1280x720x24" ./xstream --script "12:SHOT=../out/shots/6-player.png;13:OK;14:SHOT=../out/shots/7-player-controls.png;15:RIGHT;15.5:RIGHT;16:RIGHT;16.5:OK;18:SHOT=../out/shots/8-tracks.png;19:QUIT" > ../out/player.log 2>&1 || echo "exit $?" >> ../out/player.log
+          tail -20 ../out/player.log
       - name: Save logs and screenshots to the ci-linux branch
         if: always()
         run: |

@@ -270,6 +270,10 @@ int xe_app_init(void)
     xe_home_init();
     xe_platform_set_wants_frames(1);
     xe_log(1, "Xstream TV started");
+    {   /* test hook: XE_TEST_URL opens the player straight away (used by CI) */
+        const char *u = getenv("XE_TEST_URL");
+        if (u && *u) { xe_player_set_title("Test stream"); xe_player_open(u, NULL, 0); g_screen = SCR_PLAYER; }
+    }
     return 0;
 }
 
