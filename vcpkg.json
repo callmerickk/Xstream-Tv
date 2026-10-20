@@ -1,5 +1,5 @@
 {
   "name": "xstream-tv",
   "version-string": "0.1.0",
-  "dependencies": [ "sdl2", "freetype", "harfbuzz", { "name": "curl", "features": [ "schannel" ] } ]
+  "dependencies": [ "sdl2", "freetype", "harfbuzz", "curl" ]
 }
