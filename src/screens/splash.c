@@ -69,13 +69,8 @@ static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 /* Radial glow: stacked translucent discs, strongest in the middle. */
 static void radial(float cx, float cy, float radius, XeColor c, float alpha)
 {
-    const int n = 14;
-    int i;
-    float a = 1.0f - powf(1.0f - c.a * alpha, 1.0f / n);
-    for (i = n; i >= 1; i--) {
-        float r = radius * (float)i / n;
-        xe_r_rect((XeRect){ cx - r, cy - r, r * 2, r * 2 }, r, (XeColor){ c.r, c.g, c.b, a });
-    }
+    c.a *= alpha;
+    xe_r_radial(cx, cy, radius, c);
 }
 
 /* The Signal X mark (Look.kt SignalMark), drawn at (x, y) with side s. */
@@ -191,4 +186,13 @@ void xe_splash_frame(double dt, XeRect area)
         }
     }
     xe_r_end();
+}
+
+/* "Xstream" in the brand font: red X, white "stream" (Theme.kt Wordmark). Returns the width. */
+float xe_draw_wordmark(float x, float y, float px, float alpha)
+{
+    float wx = xe_label_measure("X", px, XE_FONT_BRAND, 0, 1).w;
+    xe_label_box("X", x, y, px, XE_FONT_BRAND, 0, 1, 0, (XeColor){ BRAND_RED.r, BRAND_RED.g, BRAND_RED.b, alpha });
+    xe_label_box("stream", x + wx, y, px, XE_FONT_BRAND, 0, 1, 0, (XeColor){ 1, 1, 1, alpha });
+    return wx + xe_label_measure("stream", px, XE_FONT_BRAND, 0, 1).w;
 }

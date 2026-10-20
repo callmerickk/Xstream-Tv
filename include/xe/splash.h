@@ -12,6 +12,8 @@ void xe_splash_reset(void);
 /* The Signal X mark at (x, y), side s. x1 / x2: how much of each X stroke is drawn (0..1);
  * wave: how far each of the three waves has appeared (NULL = all); alpha: overall opacity. */
 void xe_draw_signal_mark(float x, float y, float s, float x1, float x2, const float wave[3], float alpha);
+/* "Xstream" wordmark at (x, y) (top of the line), font size px. Returns its width. */
+float xe_draw_wordmark(float x, float y, float px, float alpha);
 #ifdef __cplusplus
 }
 #endif
