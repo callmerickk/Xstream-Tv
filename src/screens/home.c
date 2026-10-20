@@ -249,6 +249,7 @@ void xe_home_init(void) {
     H.search_id=xe_id("xe.home.search");H.profile_id=xe_id("xe.home.profile");H.play_id=xe_id("xe.home.play");H.list_id=xe_id("xe.home.list");
     for(i=0;i<3;i++)H.deck_ids[i]=xe_id_mix(xe_id("xe.home.deck"),i);
     xe_spring_init(&H.deck_slide,0,170,24); request_home_once();
+    xe_ui_set_focus(H.play_id); /* start on the hero's Play button, like StreamX */
 }
 void xe_home_frame(double dt,XeRect area) {
     XeEvent events[96]; int n=0; float w=area.w,h=area.h; int i;
