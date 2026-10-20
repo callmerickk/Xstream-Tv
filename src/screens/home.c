@@ -211,29 +211,35 @@ static void draw_deck(float w,float h) {
     }
     (void)h;
 }
+static int g_focus_in_rows;
 static void draw_rows(float w,float h) {
-    int row; float y=440.0f-H.page_scroll;
+    int row; const float row_h=291.0f; float y=440.0f-H.page_scroll;
+    g_focus_in_rows=0;
     for(row=0;row<H.n_rows;row++) {
         HomeRow *r=&H.rows[row]; float cardw=150,cardh=225,gap=18,vieww=w-112; int col,focus_col=-1; float rowy=y;
-        if(rowy>h+20||rowy+cardh+52<0){y+=cardh+66;continue;}
-        draw_text(r->title?r->title:"Recommended",56,rowy,22,HOME_WHITE);
-        if(r->n<=0){y+=cardh+66;continue;}
+        int visible=!(rowy>h+20||rowy+cardh+52<0);
+        y+=row_h;
+        if(visible)draw_text(r->title?r->title:"Recommended",56,rowy,22,HOME_WHITE);
+        if(r->n<=0)continue;
         H.row_scroll[row].count=r->n;H.row_scroll[row].item_w=cardw;H.row_scroll[row].gap=gap;
-        xe_ui_set_scroll_view(xe_id_mix(xe_id("xe.home.scroll"),row),(XeRect){dp(56),dp(rowy+34),dp(vieww),dp(cardh+18)},&r->scroll,(float)r->n*(cardw+gap),0);
+        if(visible)xe_ui_set_scroll_view(xe_id_mix(xe_id("xe.home.scroll"),row),(XeRect){dp(56),dp(rowy+34),dp(vieww),dp(cardh+18)},&r->scroll,(float)r->n*(cardw+gap),0);
         for(col=0;col<r->n;col++) {
-            XeMeta *m=&r->items[col]; float x=56+col*(cardw+gap)-r->scroll; XeRect rect={dp(x),dp(rowy+36),dp(cardw),dp(cardh)}; XeId id=card_id(row,col); int f=xe_ui_focusable(id,rect); float a=xe_ui_focus_anim(id),scale=1.0f+0.08f*a; float sw=cardw*scale,sh=cardh*scale,sx=x-(sw-cardw)*0.5f,sy=rowy+36-(sh-cardh)*0.5f;
-            if(f)focus_col=col;
-            if(x+cardw<45||x>w-10)continue;
+            XeMeta *m=&r->items[col]; float x=56+col*(cardw+gap)-r->scroll; XeRect rect={dp(x),dp(rowy+36),dp(cardw),dp(cardh)}; XeId id=card_id(row,col); int f; float a,scale,sw,sh,sx,sy;
+            /* off-screen rows still register a few cards so the remote can move into them */
+            if(x<-2*w||x>3*w)continue;
+            if(!visible&&(x<0||x>w))continue;
+            f=xe_ui_focusable(id,rect);
+            if(f){focus_col=col;g_focus_in_rows=1;}
+            if(xe_ui_activated(id)){if(H.opened_valid)hfree_meta(&H.opened);H.opened_valid=hcopy_meta(&H.opened,m);}
+            if(f)meta_changed(m);
+            if(!visible||x+cardw<45||x>w-10)continue;
+            a=xe_ui_focus_anim(id);scale=1.0f+0.08f*a;sw=cardw*scale;sh=cardh*scale;sx=x-(sw-cardw)*0.5f;sy=rowy+36-(sh-cardh)*0.5f;
             draw_rect(sx,sy,sw,sh,7,(XeColor){.14f,.15f,.19f,1});
             if(m->poster)draw_image(image_get_cached(m->poster,342,513),sx,sy,sw,sh,7);
-            draw_rect(sx,sy,sw,sh,7,(XeColor){.02f,.02f,.03f,0.12f});
             if(a>0.01f){draw_rect(sx-4,sy-4,sw+8,sh+8,10,(XeColor){.898f,.035f,.078f,.10f*a});draw_border(sx-2,sy-2,sw+4,sh+4,9,2,HOME_ACCENT);}
-            draw_text_fit(m->name?m->name:"Untitled",x,rowy+36+cardh+9,14,cardw,HOME_WHITE);
-            if(f)meta_changed(m);
-            if(xe_ui_activated(id)){if(H.opened_valid)hfree_meta(&H.opened);H.opened_valid=hcopy_meta(&H.opened,m);}
+            draw_text_fit(m->name?m->name:"Untitled",x,rowy+36+cardh+9,14,cardw,a>0.01f?HOME_WHITE:HOME_MUTED);
         }
         if(focus_col>=0){xe_row_scroll_to(&H.row_scroll[row],focus_col,vieww);r->scroll=H.row_scroll[row].offset;H.focused_row=row;H.focused_col=focus_col;}
-        y+=cardh+66;
     }
 }
 void xe_home_init(void) {
@@ -251,7 +257,11 @@ void xe_home_frame(double dt,XeRect area) {
     H.last_w=w;H.last_h=h;
     while(n<96&&xe_platform_poll(&events[n]))n++;
     xe_ui_begin(dt,events,n); xe_img_pump(); xe_data_pump();
-    xe_r_begin((int)w,(int)h); draw_backdrop(w,h); draw_topbar(w); draw_deck(w,h); draw_rows(w,h); xe_ui_end(); xe_r_end();
+    xe_r_begin((int)w,(int)h); draw_backdrop(w,h);
+    /* The page scrolls so the focused row sits where the first row starts; top bar and deck scroll away. */
+    xe_r_push_layer(0,-H.page_scroll,1,1); draw_topbar(w); draw_deck(w,h); xe_r_pop_layer();
+    draw_rows(w,h); xe_ui_end(); xe_r_end();
+    { float target=g_focus_in_rows?(float)H.focused_row*291.0f+(H.focused_row>0?0:0):0; float k=(float)(dt*12.0); if(k>1)k=1; H.page_scroll+=(target-H.page_scroll)*k; if(H.page_scroll<0.5f&&target==0)H.page_scroll=0; }
     if(H.backdrop_mix<1.0f)H.backdrop_mix=clampf(H.backdrop_mix+(float)(dt/0.4),0,1);
     (void)i;
 }

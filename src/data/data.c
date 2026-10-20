@@ -1,6 +1,7 @@
 #include "xe/data.h"
 #include "xe/net.h"
 #include "xe/json.h"
+#include "xe/platform.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,7 @@ static int g_initialized;
 static char *dup_n(const char *s, size_t n) { char *p; if(!s)return NULL; p=(char*)malloc(n+1); if(!p)return NULL; memcpy(p,s,n); p[n]=0; return p; }
 static char *dup_s(const char *s) { return s ? dup_n(s,strlen(s)) : NULL; }
 static void set_s(char **dst,const char *src) { free(*dst); *dst=dup_s(src); }
-static double now_seconds(void) { return (double)clock()/CLOCKS_PER_SEC; }
+static double now_seconds(void) { return xe_time_now(); }
 static int is_http_ok(const XeHttpResponse *r) { return r && !r->error && r->status>=200 && r->status<300 && r->body; }
 static void free_meta_fields(XeMeta *m) {
     int i; if(!m)return;
@@ -71,7 +72,7 @@ static void cache_put(const char *url,const char *body,size_t len) {
 chosen: free(g_cache[best].url);free(g_cache[best].body);g_cache[best].url=u;g_cache[best].body=b;g_cache[best].len=len;g_cache[best].at=now_seconds();g_cache_clock++;
 }
 static void http_done(const XeHttpResponse *r,void *u) {
-    ReqCtx *c=(ReqCtx*)u; if(c&&is_http_ok(r))cache_put(c->url,r->body,r->len); if(c&&c->done)c->done(r,c->user); if(c){free(c->url);free(c);}
+    ReqCtx *c=(ReqCtx*)u; if(c&&is_http_ok(r)&&!strstr(c->url,"/stream/"))cache_put(c->url,r->body,r->len); /* stream links expire: never cache them */ if(c&&c->done)c->done(r,c->user); if(c){free(c->url);free(c);}
 }
 static int get_url(const char *url,void (*done)(const XeHttpResponse *,void *),void *user) {
     CacheEntry *e=cache_find(url);ReqCtx *c;
@@ -80,7 +81,10 @@ static int get_url(const char *url,void (*done)(const XeHttpResponse *,void *),v
     if(!c->url||!xe_http_get(url,NULL,http_done,c)){free(c->url);free(c);return 0;}return 1;
 }
 static char *base_from_manifest(const char *url) {
-    const char *p=strstr(url,"://"),*slash; if(!p)return dup_s(url);p+=3;slash=strchr(p,'/');return slash?dup_n(url,(size_t)(slash-url)):dup_s(url);
+    size_t n=strlen(url);const char *q=strchr(url,'?');if(q)n=(size_t)(q-url);
+    if(n>=14&&!strncmp(url+n-14,"/manifest.json",14))n-=14;
+    while(n>0&&url[n-1]=='/')n--;
+    return dup_n(url,n);
 }
 static void meta_from_json(XeMeta *m,const void *o,const char *fallback_type) {
     const char *s;void *a;int i,n;
@@ -119,30 +123,41 @@ static XeStream *streams_parse(const void *arr,const char *addon,int *out_n) {
     if(!count){free(a);return NULL;}if(out_n)*out_n=count;return a;
 }
 
-/* Manifest parsing. Addon catalog metadata is retained as copied title/type/id triples. */
+/* Home shelves: every addon's manifest, then each of its catalogs that needs no extra input.
+ * Shelves come back in manifest order once every request has finished. */
 typedef struct { char *type,*id,*name; } Catalog;
-typedef struct { Addon *addon; Catalog *cats; int n_cats; void (*cb)(XeShelf*,int,void*);void *user;XeShelf *shelves;int n_shelves,pending; } HomeCtx;
-static void catalog_response(const XeHttpResponse *,void *);
-static void manifest_response(const XeHttpResponse *r,void *u) {
-    HomeCtx *h=(HomeCtx*)u;Addon *a=h->addon;void *root,*cats;int i,n;
-    if(!is_http_ok(r))return;root=xe_json_parse(r->body,r->len);if(!root)return;a->manifest=root;a->ready=1;
-    set_s(&a->name,jstr(root,"name"));if(!a->name)set_s(&a->name,"Addon");cats=xe_json_obj_get(root,"catalogs");n=xe_json_arr_len(cats);if(n>64)n=64;
-    if(n>0){h->cats=(Catalog*)calloc((size_t)n,sizeof(Catalog));if(!h->cats){xe_json_delete(root);a->manifest=NULL;return;}}
-    for(i=0;i<n;i++){void *c=xe_json_at(cats,i);h->cats[h->n_cats].type=dup_s(jstr(c,"type"));h->cats[h->n_cats].id=dup_s(jstr(c,"id"));h->cats[h->n_cats].name=dup_s(jstr(c,"name"));if(h->cats[h->n_cats].type&&h->cats[h->n_cats].id)h->n_cats++;}
-    for(i=0;i<h->n_cats;i++){
-        char *path,*url;size_t need;Catalog *c=&h->cats[i];need=strlen(c->type)+strlen(c->id)+32;path=(char*)malloc(need);if(!path)continue;snprintf(path,need,"catalog/%s/%s.json",c->type,c->id);url=join_url(a->base,path);free(path);if(!url)continue;
-        { /* Each callback owns the small request context. */
-          typedef struct { HomeCtx *home; Catalog *cat; char *url; } CatCtx;CatCtx *cc=(CatCtx*)calloc(1,sizeof(*cc));if(!cc){free(url);continue;}cc->home=h;cc->cat=c;cc->url=url;h->pending++;get_url(url,catalog_response,cc);
-        }
-    }
+typedef struct { void (*cb)(XeShelf*,int,void*);void *user;XeShelf *shelves;int *order;int n_shelves,pending; } HomeCtx;
+typedef struct { HomeCtx *home; Catalog cat; char *url; int order; } CatCtx;
+typedef struct { HomeCtx *home; Addon *addon; int index; } ManCtx;
+static int catalog_needs_input(const void *c) {
+    void *req=xe_json_obj_get(c,"extraRequired"),*extra=xe_json_obj_get(c,"extra");int i,n;
+    if(xe_json_arr_len(req)>0)return 1;
+    n=xe_json_arr_len(extra);
+    for(i=0;i<n;i++){void *x=xe_json_at(extra,i);void *v=xe_json_obj_get(x,"isRequired");if(v&&xe_json_int(x,"isRequired",0))return 1;}
+    return 0;
+}
+static void home_finish(HomeCtx *h) {
+    int i,j;
+    for(i=1;i<h->n_shelves;i++)for(j=i;j>0&&h->order[j]<h->order[j-1];j--){XeShelf t=h->shelves[j];int o=h->order[j];h->shelves[j]=h->shelves[j-1];h->order[j]=h->order[j-1];h->shelves[j-1]=t;h->order[j-1]=o;}
+    if(h->cb)h->cb(h->shelves,h->n_shelves,h->user);else xe_data_free_shelves(h->shelves,h->n_shelves);
+    free(h->order);free(h);
 }
 static void catalog_response(const XeHttpResponse *r,void *u) {
-    typedef struct { HomeCtx *home; Catalog *cat; char *url; } CatCtx;CatCtx *c=(CatCtx*)u;HomeCtx *h=c->home;
-    if(is_http_ok(r)){void *root=xe_json_parse(r->body,r->len);void *metas=root?xe_json_obj_get(root,"metas"):NULL;int n=xe_json_arr_len(metas),i;XeShelf *p;
-        if(n>MAX_ITEMS)n=MAX_ITEMS;p=(XeShelf*)realloc(h->shelves,(size_t)(h->n_shelves+1)*sizeof(XeShelf));if(p){h->shelves=p;memset(&p[h->n_shelves],0,sizeof(XeShelf));p[h->n_shelves].title=dup_s(c->cat->name?c->cat->name:c->cat->id);if(n>0)p[h->n_shelves].items=(XeMeta*)calloc((size_t)n,sizeof(XeMeta));if(n==0||p[h->n_shelves].items){for(i=0;i<n;i++)meta_from_json(&p[h->n_shelves].items[i],xe_json_at(metas,i),c->cat->type);p[h->n_shelves].n=n;h->n_shelves++;}}
+    CatCtx *c=(CatCtx*)u;HomeCtx *h=c->home;
+    if(is_http_ok(r)){void *root=xe_json_parse(r->body,r->len);void *metas=root?xe_json_obj_get(root,"metas"):NULL;int n=xe_json_arr_len(metas),i;
+        if(n>MAX_ITEMS)n=MAX_ITEMS;
+        if(n>0){XeShelf *p=(XeShelf*)realloc(h->shelves,(size_t)(h->n_shelves+1)*sizeof(XeShelf));int *o=(int*)realloc(h->order,(size_t)(h->n_shelves+1)*sizeof(int));
+            if(p)h->shelves=p;if(o)h->order=o;
+            if(p&&o){XeShelf *s=&p[h->n_shelves];char title[300];memset(s,0,sizeof(*s));
+                if(c->cat.name&&c->cat.type&&(!strcmp(c->cat.type,"movie")||!strcmp(c->cat.type,"series")))snprintf(title,sizeof(title),"%s %s",c->cat.name,!strcmp(c->cat.type,"movie")?"Movies":"Series");
+                else snprintf(title,sizeof(title),"%s",c->cat.name?c->cat.name:c->cat.id);
+                s->title=dup_s(title);s->items=(XeMeta*)calloc((size_t)n,sizeof(XeMeta));
+                if(s->items){for(i=0;i<n;i++)meta_from_json(&s->items[i],xe_json_at(metas,i),c->cat.type);s->n=n;o[h->n_shelves]=c->order;h->n_shelves++;}else free(s->title);}}
         if(root)xe_json_delete(root);
     }
-    free(c->url);free(c);if(h->pending>0)h->pending--;if(h->pending==0&&h->cb){h->cb(h->shelves,h->n_shelves,h->user);h->shelves=NULL;h->n_shelves=0;free(h);}
+    free(c->cat.type);free(c->cat.id);free(c->cat.name);free(c->url);free(c);
+    if(h->pending>0)h->pending--;
+    if(h->pending==0)home_finish(h);
 }
 
 void xe_data_init(const char *const *urls,int n,const char *key) {
@@ -153,27 +168,33 @@ void xe_data_shutdown(void) {
     Addon *a=g_addons,*next;int i;while(a){next=a->next;free(a->manifest_url);free(a->base);free(a->name);if(a->manifest)xe_json_delete(a->manifest);free(a);a=next;}g_addons=NULL;g_addon_count=0;free(g_tmdb_key);g_tmdb_key=NULL;for(i=0;i<CACHE_MAX;i++){free(g_cache[i].url);free(g_cache[i].body);memset(&g_cache[i],0,sizeof(g_cache[i]));}g_initialized=0;
 }
 void xe_data_pump(void) { xe_net_pump(); }
-void xe_data_home(void (*cb)(XeShelf*,int,void*),void *u) {
-    Addon *a;HomeCtx *h=(HomeCtx*)calloc(1,sizeof(*h));if(!h)return;h->cb=cb;h->user=u;
-    /* Request manifests first. A manifest failure is counted as a completed empty addon. */
-    for(a=g_addons;a;a=a->next){typedef struct { HomeCtx *home; Addon *addon; } ManCtx;ManCtx *mc=(ManCtx*)calloc(1,sizeof(*mc));if(!mc)continue;mc->home=h;mc->addon=a;h->addon=a;h->pending++;
-        /* Adapt the manifest callback's per-addon pointer into a callback that retains the home context. */
-        { /* static local adapter is declared below through a wrapper context */
-          extern void xe_data_internal_manifest_cb(const XeHttpResponse*,void*);if(!get_url(a->manifest_url,xe_data_internal_manifest_cb,mc)){free(mc);h->pending--;}
+static void manifest_cb(const XeHttpResponse *r,void *u) {
+    ManCtx *mc=(ManCtx*)u;HomeCtx *h=mc->home;Addon *a=mc->addon;
+    if(is_http_ok(r)){void *root=xe_json_parse(r->body,r->len);
+        if(root){void *cats;int i,n;
+            if(a->manifest)xe_json_delete(a->manifest);
+            a->manifest=root;a->ready=1;set_s(&a->name,jstr(root,"name"));if(!a->name)set_s(&a->name,"Addon");
+            cats=xe_json_obj_get(root,"catalogs");n=xe_json_arr_len(cats);if(n>64)n=64;
+            for(i=0;i<n;i++){void *c=xe_json_at(cats,i);const char *type=jstr(c,"type"),*id=jstr(c,"id"),*name=jstr(c,"name");char path[1024];char *url;CatCtx *cc;
+                if(!type||!id||catalog_needs_input(c))continue;
+                snprintf(path,sizeof(path),"catalog/%s/%s.json",type,id);url=join_url(a->base,path);if(!url)continue;
+                cc=(CatCtx*)calloc(1,sizeof(*cc));if(!cc){free(url);continue;}
+                cc->home=h;cc->cat.type=dup_s(type);cc->cat.id=dup_s(id);cc->cat.name=dup_s(name?name:id);cc->url=url;cc->order=mc->index*100+i;
+                h->pending++;
+                if(!get_url(url,catalog_response,cc)){h->pending--;free(cc->cat.type);free(cc->cat.id);free(cc->cat.name);free(cc->url);free(cc);}
+            }
         }
     }
-    if(h->pending==0){if(cb)cb(NULL,0,u);free(h);}
+    free(mc);
+    if(h->pending>0)h->pending--;
+    if(h->pending==0)home_finish(h);
 }
-void xe_data_internal_manifest_cb(const XeHttpResponse *r,void *u) {
-    typedef struct { HomeCtx *home; Addon *addon; } ManCtx;ManCtx *mc=(ManCtx*)u;HomeCtx *h=mc->home;Addon *a=mc->addon;
-    /* manifest_response needs a per-addon home view, but catalog callbacks aggregate into the shared home */
-    {HomeCtx local;memset(&local,0,sizeof(local));local.addon=a;local.cb=h->cb;local.user=h->user;
-     if(is_http_ok(r)){void *root=xe_json_parse(r->body,r->len);void *cats;int i,n;if(root){a->manifest=root;a->ready=1;set_s(&a->name,jstr(root,"name"));if(!a->name)set_s(&a->name,"Addon");cats=xe_json_obj_get(root,"catalogs");n=xe_json_arr_len(cats);if(n>64)n=64;
-       for(i=0;i<n;i++){void *c=xe_json_at(cats,i);const char *type=jstr(c,"type"),*id=jstr(c,"id"),*name=jstr(c,"name");char path[1024];char *url;typedef struct { HomeCtx *home; Catalog cat; char *url; } CatCtx;CatCtx *cc;
-         if(!type||!id)continue;snprintf(path,sizeof(path),"catalog/%s/%s.json",type,id);url=join_url(a->base,path);if(!url)continue;cc=(CatCtx*)calloc(1,sizeof(*cc));if(!cc){free(url);continue;}cc->home=h;cc->cat.type=dup_s(type);cc->cat.id=dup_s(id);cc->cat.name=dup_s(name?name:id);cc->url=url;h->pending++;if(!get_url(url,catalog_response,cc)){h->pending--;free(cc->cat.type);free(cc->cat.id);free(cc->cat.name);free(cc->url);free(cc);} }
-     }}
-    }
-    if(h->pending>0)h->pending--;if(h->pending==0){if(h->cb)h->cb(h->shelves,h->n_shelves,h->user);else xe_data_free_shelves(h->shelves,h->n_shelves);h->shelves=NULL;free(h);}free(mc);
+void xe_data_home(void (*cb)(XeShelf*,int,void*),void *u) {
+    Addon *a;int idx=0;HomeCtx *h=(HomeCtx*)calloc(1,sizeof(*h));if(!h)return;h->cb=cb;h->user=u;
+    h->pending=1;   /* held until every manifest request is queued (cache hits answer at once) */
+    for(a=g_addons;a;a=a->next,idx++){ManCtx *mc=(ManCtx*)calloc(1,sizeof(*mc));if(!mc)continue;mc->home=h;mc->addon=a;mc->index=idx;h->pending++;
+        if(!get_url(a->manifest_url,manifest_cb,mc)){free(mc);h->pending--;}}
+    if(--h->pending==0)home_finish(h);
 }
 
 /* Cinemeta helpers. The callback owns returned arrays and must release them with xe_data_free_*. */
@@ -193,11 +214,11 @@ void xe_data_search(const char *q,void (*cb)(XeMeta*,int,void*),void *u) { char 
 
 typedef struct { char *type,*id,*addon;void (*cb)(XeStream*,int,int,void*);void *user;int pending; } StreamCtx;
 static void stream_response(const XeHttpResponse *r,void *u) { StreamCtx *c=(StreamCtx*)u;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){void *arr=xe_json_obj_get(root,"streams");s=streams_parse(arr,c->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }
-void xe_data_streams(const char *type,const char *id,void (*cb)(XeStream*,int,int,void*),void *u) { Addon *a;StreamCtx *c;if(!type||!id)return;c=(StreamCtx*)calloc(1,sizeof(*c));if(!c)return;c->type=dup_s(type);c->id=dup_s(id);c->cb=cb;c->user=u;
+void xe_data_streams(const char *type,const char *id,void (*cb)(XeStream*,int,int,void*),void *u) { Addon *a;StreamCtx *c;if(!type||!id)return;c=(StreamCtx*)calloc(1,sizeof(*c));if(!c)return;c->type=dup_s(type);c->id=dup_s(id);c->cb=cb;c->user=u;c->pending=1; /* held while queuing; cache hits answer at once */
     for(a=g_addons;a;a=a->next){char path[1200];char *url;snprintf(path,sizeof(path),"stream/%s/%s.json",type,id);url=join_url(a->base,path);if(!url)continue;c->pending++;{typedef struct { StreamCtx *parent;char *addon; } SC;SC *sc=(SC*)calloc(1,sizeof(*sc));if(!sc){c->pending--;free(url);continue;}sc->parent=c;sc->addon=dup_s(a->name?a->name:a->base);/* adapter context is passed via a trampoline below */
         extern void xe_data_internal_stream_cb(const XeHttpResponse*,void*);if(!get_url(url,xe_data_internal_stream_cb,sc)){c->pending--;free(sc->addon);free(sc);}}
         free(url);
     }
-    if(c->pending==0){if(cb)cb(NULL,0,1,u);free(c->type);free(c->id);free(c->addon);free(c);}
+    if(--c->pending==0){if(cb)cb(NULL,0,1,u);free(c->type);free(c->id);free(c->addon);free(c);}
 }
 void xe_data_internal_stream_cb(const XeHttpResponse *r,void *u) { typedef struct { StreamCtx *parent;char *addon; } SC;SC *sc=(SC*)u;StreamCtx *c=sc->parent;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){s=streams_parse(xe_json_obj_get(root,"streams"),sc->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;free(sc->addon);free(sc);if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }

@@ -104,7 +104,7 @@ static Glyph *glyph_get(XeFont *f, unsigned gid, int *reset)
     unsigned h = (f->id * 2654435761u) ^ (gid * 40503u);
     unsigned i, slot;
     FT_Bitmap *bm;
-    int w, hh, x, y, px, py;
+    int w, hh, x, y, px = 0, py = 0;
     if (!atlas_ready()) return NULL;
     for (i = 0; i < GLYPH_SLOTS; i++) {
         slot = (h + i) & (GLYPH_SLOTS - 1);
