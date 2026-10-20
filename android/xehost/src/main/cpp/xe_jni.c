@@ -14,7 +14,17 @@ static jobject g_asset_manager_obj;
 static AAssetManager *g_asset_manager;
 static int g_initialized;
 
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) { (void)reserved; g_vm = vm; return JNI_VERSION_1_6; }
+extern int xe_net_android_jni_init(JNIEnv *env, JavaVM *vm);
+/* The only JNI_OnLoad in libxe_android: caches the VM and the OkHttp bridge (net_android_jni.c). */
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
+{
+    (void)reserved; g_vm = vm;
+    JNIEnv *env = NULL;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+    if (!xe_net_android_jni_init(env, vm)) __android_log_print(ANDROID_LOG_ERROR, "xe", "XeNet bridge unavailable");
+    return JNI_VERSION_1_6;
+}
+JavaVM *xe_android_vm(void) { return g_vm; }
 
 int xe_asset_read(const char *path, void **data, size_t *len)
 {
@@ -67,7 +77,6 @@ static void push_simple_event(XeEventType type, XeKey key, int repeat)
 JNIEXPORT void JNICALL Java_com_xe_xehost_XeActivity_nativeInit(JNIEnv *env, jobject thiz,
     jstring data_dir, jstring cache_dir, jint width, jint height, jfloat density, jobject assets)
 {
-    (void)thiz;
     const char *data = (*env)->GetStringUTFChars(env, data_dir, NULL);
     const char *cache = (*env)->GetStringUTFChars(env, cache_dir, NULL);
     xe_platform_set_dirs(data, cache);
@@ -77,6 +86,14 @@ JNIEXPORT void JNICALL Java_com_xe_xehost_XeActivity_nativeInit(JNIEnv *env, job
     if (g_asset_manager_obj) (*env)->DeleteGlobalRef(env, g_asset_manager_obj);
     g_asset_manager_obj = (*env)->NewGlobalRef(env, assets);
     g_asset_manager = AAssetManager_fromJava(env, assets);
+    /* Configure the shared OkHttp client (cache dir) before the first request. */
+    jclass net = (*env)->FindClass(env, "com/xe/xehost/XeNet");
+    if (net) {
+        jmethodID m = (*env)->GetStaticMethodID(env, net, "configure", "(Landroid/content/Context;)V");
+        if (m) (*env)->CallStaticVoidMethod(env, net, m, thiz);
+        (*env)->DeleteLocalRef(env, net);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     g_initialized = 1;
     if (xe_app_init() != 0) xe_log(3, "xe_app_init reported failure");
     XeEvent resize; memset(&resize, 0, sizeof(resize)); resize.type = XE_EV_RESIZE; resize.w = width; resize.h = height; xe_platform_push_event(&resize);

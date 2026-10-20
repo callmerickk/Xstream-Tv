@@ -5,7 +5,7 @@ static size_t xe_stub_tex_bytes;
 void xe_r_init(void){} void xe_r_shutdown(void){} void xe_r_begin(int w,int h){(void)w;(void)h;} void xe_r_end(void){} void xe_r_set_output(int w,int h){(void)w;(void)h;} void xe_r_clear(XeColor c){(void)c;} void xe_r_output_size(int *w,int *h){if(w)*w=1280;if(h)*h=720;}
 void xe_r_rect(XeRect r,float q,XeColor c){(void)r;(void)q;(void)c;} void xe_r_rect_vgrad(XeRect r,float q,XeColor a,XeColor b){(void)r;(void)q;(void)a;(void)b;} void xe_r_rect_hgrad(XeRect r,float q,XeColor a,XeColor b){(void)r;(void)q;(void)a;(void)b;}
 void xe_r_border(XeRect r,float q,float w,XeColor c){(void)r;(void)q;(void)w;(void)c;} void xe_r_border_progress(XeRect r,float q,float w,float p,XeColor c){(void)r;(void)q;(void)w;(void)p;(void)c;} void xe_r_glow(XeRect r,float q,float s,XeColor c){(void)r;(void)q;(void)s;(void)c;}
-void xe_r_image(const XeTexture*t,XeRect r,float q,float a,int c){(void)t;(void)r;(void)q;(void)a;(void)c;} void xe_r_image_blurred(const XeTexture*t,XeRect r,float s,float a){(void)t;(void)r;(void)s;(void)a;} void xe_r_image_tint(const XeTexture*t,XeRect r,float q,XeColor c,float a,float b,float d,float e){(void)t;(void)r;(void)q;(void)c;(void)a;(void)b;(void)d;(void)e;} void xe_r_line(float a,float b,float c,float d,float e,XeColor f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;}
+void xe_r_image(const XeTexture*t,XeRect r,float q,float a,int c){(void)t;(void)r;(void)q;(void)a;(void)c;} void xe_r_image_blurred(const XeTexture*t,XeRect r,float s,float a){(void)t;(void)r;(void)s;(void)a;} void xe_r_image_tint(const XeTexture*t,XeRect r,float q,XeColor c,float a,float b,float d,float e){(void)t;(void)r;(void)q;(void)c;(void)a;(void)b;(void)d;(void)e;} void xe_r_line(float a,float b,float c,float d,float e,XeColor f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;} void xe_r_arc(float a,float b,float c,float d,float e,float g,XeColor f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)g;(void)f;}
 void xe_r_push_clip(XeRect r,float q){(void)r;(void)q;} void xe_r_pop_clip(void){} static float stub_scale=1; void xe_r_push_layer(float x,float y,float s,float a){(void)x;(void)y;(void)a;stub_scale=s;} void xe_r_pop_layer(void){stub_scale=1;} float xe_r_current_scale(void){return stub_scale;}
 XeTexture *xe_tex_create(int w,int h,const void*p){if(w<=0||h<=0)return NULL;XeTexture*t=(XeTexture*)calloc(1,sizeof(*t));if(t){t->w=w;t->h=h;t->id=1;xe_stub_tex_bytes+=(size_t)w*h*4;}(void)p;return t;} void xe_tex_update(XeTexture*t,const void*p){(void)t;(void)p;} void xe_tex_update_rows(XeTexture*t,int a,int b,const void*p){(void)t;(void)a;(void)b;(void)p;} void xe_tex_destroy(XeTexture*t){if(t){xe_stub_tex_bytes-=(size_t)t->w*t->h*4;free(t);}} size_t xe_tex_bytes_in_use(void){return xe_stub_tex_bytes;}
 #else
@@ -90,29 +90,31 @@ static void load_gl(void) {}
 #define XE_BATCH_QUADS 4096
 #define XE_CLIP_MAX 16
 #define XE_LAYER_MAX 16
-typedef struct { float x,y,u,v; float r,g,b,a; float shape_x,shape_y,half_w,half_h,corner; } Vertex;
+/* shape_*: position in the shape's own frame (pixels); mode 0 fill, 1 ring (ring = width), 2 arc (half_w = radius,
+ * half_h = half stroke, sc = sin/cos of half the opening). */
+typedef struct { float x,y,u,v; float r,g,b,a; float shape_x,shape_y,half_w,half_h,corner; float mode,ring,sc_s,sc_c; } Vertex;
 typedef struct { XeRect r; float radius; } Clip;
 typedef struct { float tx,ty,scale,alpha; } Layer;
-static Vertex verts[XE_BATCH_QUADS*6]; static int vcount;
+static Vertex verts[XE_BATCH_QUADS*6]; static int vcount; static float g_ring;
 static GLuint program,vbo,vao; static GLint u_view,u_tex,u_use_tex,u_clip;
 static GLuint bound_tex; static int fbw=1,fbh=1; static size_t tex_bytes;
 static Clip clips[XE_CLIP_MAX]; static int clip_n; static Layer layers[XE_LAYER_MAX]; static int layer_n;
 static XeRect current_clip; static int has_clip;
-static const char *vshader_es="attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_col; attribute vec4 a_shape; attribute float a_radius; uniform vec2 u_view; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; varying float v_radius; void main(){ vec2 p=vec2(a_pos.x/u_view.x*2.0-1.0,1.0-a_pos.y/u_view.y*2.0); gl_Position=vec4(p,0.0,1.0); v_uv=a_uv; v_col=a_col; v_shape=a_shape; v_radius=a_radius; }";
-static const char *fshader_es="#extension GL_OES_standard_derivatives : enable\nprecision mediump float; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; uniform sampler2D u_tex; uniform int u_use_tex; uniform vec4 u_clip; varying float v_radius; float sdRound(vec2 p,vec2 b,float r){vec2 q=abs(p)-b+vec2(r);return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;} void main(){ float d=sdRound(v_shape.xy, v_shape.zw, v_radius); float aa=max(fwidth(d),0.7); float cov=1.0-smoothstep(-aa,aa,d); vec4 c=v_col; if(u_use_tex==1){vec4 t=texture2D(u_tex,v_uv);c*=vec4(t.rgb*t.a,t.a);} c*=cov; gl_FragColor=c; }";
+static const char *vshader_es="attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_col; attribute vec4 a_shape; attribute float a_radius; attribute vec4 a_extra; uniform vec2 u_view; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; varying float v_radius; varying vec4 v_extra; void main(){ vec2 p=vec2(a_pos.x/u_view.x*2.0-1.0,1.0-a_pos.y/u_view.y*2.0); gl_Position=vec4(p,0.0,1.0); v_uv=a_uv; v_col=a_col; v_shape=a_shape; v_radius=a_radius; v_extra=a_extra; }";
+static const char *fshader_es="#extension GL_OES_standard_derivatives : enable\nprecision mediump float; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; uniform sampler2D u_tex; uniform int u_use_tex; uniform vec4 u_clip; varying float v_radius; varying vec4 v_extra; float sdRound(vec2 p,vec2 b,float r){vec2 q=abs(p)-b+vec2(r);return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;} float shapeDist(){ if(v_extra.x>1.5){ vec2 p=v_shape.xy; p.x=abs(p.x); vec2 sc=v_extra.zw; return ((sc.y*p.x>sc.x*p.y)?length(p-sc*v_shape.z):abs(length(p)-v_shape.z))-v_shape.w; } float d=sdRound(v_shape.xy, v_shape.zw, v_radius); if(v_extra.x>0.5) d=abs(d+v_extra.y*0.5)-v_extra.y*0.5; return d; } void main(){ float d=shapeDist(); float aa=max(fwidth(d),0.7); float cov=1.0-smoothstep(-aa,aa,d); vec4 c=v_col; if(u_use_tex==1){vec4 t=texture2D(u_tex,v_uv);c*=vec4(t.rgb*t.a,t.a);} c*=cov; gl_FragColor=c; }";
 #if !XE_GL_ES
-static const char *vshader_gl="#version 330 core\n#define XE_DESKTOP_GL 1\nlayout(location=0) in vec2 a_pos; layout(location=1) in vec2 a_uv; layout(location=2) in vec4 a_col; layout(location=3) in vec4 a_shape; layout(location=4) in float a_radius; uniform vec2 u_view; out vec2 v_uv; out vec4 v_col; out vec4 v_shape; out float v_radius; void main(){vec2 p=vec2(a_pos.x/u_view.x*2.0-1.0,1.0-a_pos.y/u_view.y*2.0);gl_Position=vec4(p,0,1);v_uv=a_uv;v_col=a_col;v_shape=a_shape;v_radius=a_radius;}";
-static const char *fshader_gl="#version 330 core\n#define XE_DESKTOP_GL 1\nin vec2 v_uv; in vec4 v_col; in vec4 v_shape; in float v_radius; uniform sampler2D u_tex; uniform int u_use_tex; uniform vec4 u_clip; out vec4 frag; float sdRound(vec2 p,vec2 b,float r){vec2 q=abs(p)-b+vec2(r);return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;} void main(){float d=sdRound(v_shape.xy,v_shape.zw,v_radius);float aa=max(fwidth(d),0.7);float cov=1.0-smoothstep(-aa,aa,d);vec4 c=v_col;if(u_use_tex==1){vec4 t=texture(u_tex,v_uv);c*=vec4(t.rgb*t.a,t.a);}c*=cov;frag=c;}";
+static const char *vshader_gl="#version 330 core\n#define XE_DESKTOP_GL 1\nlayout(location=0) in vec2 a_pos; layout(location=1) in vec2 a_uv; layout(location=2) in vec4 a_col; layout(location=3) in vec4 a_shape; layout(location=4) in float a_radius; layout(location=5) in vec4 a_extra; uniform vec2 u_view; out vec2 v_uv; out vec4 v_col; out vec4 v_shape; out float v_radius; out vec4 v_extra; void main(){vec2 p=vec2(a_pos.x/u_view.x*2.0-1.0,1.0-a_pos.y/u_view.y*2.0);gl_Position=vec4(p,0,1);v_uv=a_uv;v_col=a_col;v_shape=a_shape;v_radius=a_radius;v_extra=a_extra;}";
+static const char *fshader_gl="#version 330 core\n#define XE_DESKTOP_GL 1\nin vec2 v_uv; in vec4 v_col; in vec4 v_shape; in float v_radius; in vec4 v_extra; uniform sampler2D u_tex; uniform int u_use_tex; uniform vec4 u_clip; out vec4 frag; float sdRound(vec2 p,vec2 b,float r){vec2 q=abs(p)-b+vec2(r);return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;} float shapeDist(){ if(v_extra.x>1.5){ vec2 p=v_shape.xy; p.x=abs(p.x); vec2 sc=v_extra.zw; return ((sc.y*p.x>sc.x*p.y)?length(p-sc*v_shape.z):abs(length(p)-v_shape.z))-v_shape.w; } float d=sdRound(v_shape.xy,v_shape.zw,v_radius); if(v_extra.x>0.5) d=abs(d+v_extra.y*0.5)-v_extra.y*0.5; return d; } void main(){float d=shapeDist();float aa=max(fwidth(d),0.7);float cov=1.0-smoothstep(-aa,aa,d);vec4 c=v_col;if(u_use_tex==1){vec4 t=texture(u_tex,v_uv);c*=vec4(t.rgb*t.a,t.a);}c*=cov;frag=c;}";
 #endif
 static GLuint compile_shader(GLenum type,const char *src){GLuint s=glCreateShader(type);glShaderSource(s,1,&src,0);glCompileShader(s);GLint ok=0;glGetShaderiv(s,GL_COMPILE_STATUS,&ok);if(!ok){char log[1024];GLsizei n=0;glGetShaderInfoLog(s,sizeof(log),&n,log);(void)log;glDeleteShader(s);return 0;}return s;}
 static void flush(void){if(!vcount||!program)return;
 #if !XE_GL_ES
 glBindVertexArray(vao);
 #endif
-glUseProgram(program);glUniform2f(u_view,(float)fbw,(float)fbh);glUniform1i(u_tex,0);glUniform1i(u_use_tex,bound_tex?1:0);if(bound_tex){glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,bound_tex);}glBindBuffer(GL_ARRAY_BUFFER,vbo);glBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)(vcount*sizeof(Vertex)),verts);glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);glEnableVertexAttribArray(3);glEnableVertexAttribArray(4);glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)0);glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(2*sizeof(float)));glVertexAttribPointer(2,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(4*sizeof(float)));glVertexAttribPointer(3,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(8*sizeof(float)));glVertexAttribPointer(4,1,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(12*sizeof(float)));glDrawArrays(GL_TRIANGLES,0,vcount);vcount=0;}
+glUseProgram(program);glUniform2f(u_view,(float)fbw,(float)fbh);glUniform1i(u_tex,0);glUniform1i(u_use_tex,bound_tex?1:0);if(bound_tex){glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,bound_tex);}glBindBuffer(GL_ARRAY_BUFFER,vbo);glBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)(vcount*sizeof(Vertex)),verts);glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);glEnableVertexAttribArray(3);glEnableVertexAttribArray(4);glEnableVertexAttribArray(5);glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)0);glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(2*sizeof(float)));glVertexAttribPointer(2,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(4*sizeof(float)));glVertexAttribPointer(3,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(8*sizeof(float)));glVertexAttribPointer(4,1,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(12*sizeof(float)));glVertexAttribPointer(5,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)(13*sizeof(float)));glDrawArrays(GL_TRIANGLES,0,vcount);vcount=0;}
 static void bind_texture(GLuint t){if(bound_tex!=t){flush();bound_tex=t;}}
 static XeColor premul(XeColor c,float a){c.a*=a;c.r*=c.a;c.g*=c.a;c.b*=c.a;return c;}
-static void quad(XeRect r,float radius,XeColor c,XeColor c2,int grad,int kind,float extra0,float extra1,float u0,float v0,float u1,float v1){if(vcount+6>XE_BATCH_QUADS*6)flush();Layer l={0,0,1,1};if(layer_n)l=layers[layer_n-1];r.x=r.x*l.scale+l.tx;r.y=r.y*l.scale+l.ty;r.w*=l.scale;r.h*=l.scale;c=premul(c,l.alpha);c2=premul(c2,l.alpha);float rad=fmaxf(0,fminf(radius,fminf(r.w,r.h)*.5f));float x0=r.x,y0=r.y,x1=r.x+r.w,y1=r.y+r.h;float px[6][2]={{x0,y0},{x1,y0},{x1,y1},{x0,y0},{x1,y1},{x0,y1}};float uv[6][2]={{u0,v0},{u1,v0},{u1,v1},{u0,v0},{u1,v1},{u0,v1}};for(int i=0;i<6;i++){Vertex *v=&verts[vcount++];v->x=px[i][0];v->y=px[i][1];v->u=uv[i][0];v->v=uv[i][1];float t=grad==1?(px[i][1]-y0)/(r.h?r.h:1):grad==2?(px[i][0]-x0)/(r.w?r.w:1):0;XeColor cc=grad? (XeColor){c.r+(c2.r-c.r)*t,c.g+(c2.g-c.g)*t,c.b+(c2.b-c.b)*t,c.a+(c2.a-c.a)*t}:c;v->r=cc.r;v->g=cc.g;v->b=cc.b;v->a=cc.a;v->shape_x=px[i][0]-(x0+x1)*0.5f;v->shape_y=px[i][1]-(y0+y1)*0.5f;v->half_w=r.w*0.5f;v->half_h=r.h*0.5f;v->corner=rad;}}
+static void quad(XeRect r,float radius,XeColor c,XeColor c2,int grad,int kind,float extra0,float extra1,float u0,float v0,float u1,float v1){if(vcount+6>XE_BATCH_QUADS*6)flush();Layer l={0,0,1,1};if(layer_n)l=layers[layer_n-1];r.x=r.x*l.scale+l.tx;r.y=r.y*l.scale+l.ty;r.w*=l.scale;r.h*=l.scale;c=premul(c,l.alpha);c2=premul(c2,l.alpha);float rad=fmaxf(0,fminf(radius,fminf(r.w,r.h)*.5f));float x0=r.x,y0=r.y,x1=r.x+r.w,y1=r.y+r.h;float px[6][2]={{x0,y0},{x1,y0},{x1,y1},{x0,y0},{x1,y1},{x0,y1}};float uv[6][2]={{u0,v0},{u1,v0},{u1,v1},{u0,v0},{u1,v1},{u0,v1}};for(int i=0;i<6;i++){Vertex *v=&verts[vcount++];v->x=px[i][0];v->y=px[i][1];v->u=uv[i][0];v->v=uv[i][1];float t=grad==1?(px[i][1]-y0)/(r.h?r.h:1):grad==2?(px[i][0]-x0)/(r.w?r.w:1):0;XeColor cc=grad? (XeColor){c.r+(c2.r-c.r)*t,c.g+(c2.g-c.g)*t,c.b+(c2.b-c.b)*t,c.a+(c2.a-c.a)*t}:c;v->r=cc.r;v->g=cc.g;v->b=cc.b;v->a=cc.a;v->shape_x=px[i][0]-(x0+x1)*0.5f;v->shape_y=px[i][1]-(y0+y1)*0.5f;v->half_w=r.w*0.5f;v->half_h=r.h*0.5f;v->corner=rad;v->mode=g_ring>0?1.0f:0.0f;v->ring=g_ring*l.scale;v->sc_s=v->sc_c=0;}}
 void xe_r_init(void){
 #if !XE_GL_ES
 load_gl();
@@ -122,7 +124,11 @@ const char *vs=vshader_es,*fs=fshader_es;
 #else
 const char *vs=vshader_gl,*fs=fshader_gl;
 #endif
-GLuint v=compile_shader(GL_VERTEX_SHADER,vs),f=compile_shader(GL_FRAGMENT_SHADER,fs);program=glCreateProgram();glAttachShader(program,v);glAttachShader(program,f);glLinkProgram(program);GLint ok=0;glGetProgramiv(program,GL_LINK_STATUS,&ok);glDeleteShader(v);glDeleteShader(f);if(!ok){program=0;return;}u_view=glGetUniformLocation(program,"u_view");u_tex=glGetUniformLocation(program,"u_tex");u_use_tex=glGetUniformLocation(program,"u_use_tex");u_clip=glGetUniformLocation(program,"u_clip");
+GLuint v=compile_shader(GL_VERTEX_SHADER,vs),f=compile_shader(GL_FRAGMENT_SHADER,fs);program=glCreateProgram();glAttachShader(program,v);glAttachShader(program,f);
+#if XE_GL_ES
+glBindAttribLocation(program,0,"a_pos");glBindAttribLocation(program,1,"a_uv");glBindAttribLocation(program,2,"a_col");glBindAttribLocation(program,3,"a_shape");glBindAttribLocation(program,4,"a_radius");glBindAttribLocation(program,5,"a_extra");
+#endif
+glLinkProgram(program);GLint ok=0;glGetProgramiv(program,GL_LINK_STATUS,&ok);glDeleteShader(v);glDeleteShader(f);if(!ok){program=0;return;}u_view=glGetUniformLocation(program,"u_view");u_tex=glGetUniformLocation(program,"u_tex");u_use_tex=glGetUniformLocation(program,"u_use_tex");u_clip=glGetUniformLocation(program,"u_clip");
 #if !XE_GL_ES
 glGenVertexArrays(1,&vao);glBindVertexArray(vao);
 #endif
@@ -141,13 +147,48 @@ void xe_r_end(void){flush();}
 void xe_r_rect(XeRect r,float rad,XeColor c){bind_texture(0);quad(r,rad,c,c,0,0,0,0,0,0,1,1);}
 void xe_r_rect_vgrad(XeRect r,float rad,XeColor a,XeColor b){bind_texture(0);quad(r,rad,a,b,1,0,0,0,0,0,1,1);}
 void xe_r_rect_hgrad(XeRect r,float rad,XeColor a,XeColor b){bind_texture(0);quad(r,rad,a,b,2,0,0,0,0,0,1,1);}
-void xe_r_border(XeRect r,float rad,float width,XeColor c){(void)rad;if(width<=0)return;if(width*2>r.w)width=r.w*.5f;if(width*2>r.h)width=r.h*.5f;xe_r_rect((XeRect){r.x,r.y,r.w,width},0,c);xe_r_rect((XeRect){r.x,r.y+r.h-width,r.w,width},0,c);xe_r_rect((XeRect){r.x,r.y+width,width,r.h-2*width},0,c);xe_r_rect((XeRect){r.x+r.w-width,r.y+width,width,r.h-2*width},0,c);}
-void xe_r_border_progress(XeRect r,float rad,float width,float progress,XeColor c){if(progress<=0)return;if(progress>1)progress=1;/* Four edge segments, clockwise from top-left. */float perimeter=2*(r.w+r.h);float left=progress*perimeter;XeRect s[4]={{r.x,r.y,r.w, width},{r.x+r.w-width,r.y,width,r.h},{r.x,r.y+r.h-width,r.w,width},{r.x,r.y,width,r.h}};float lens[4]={r.w,r.h,r.w,r.h};for(int i=0;i<4&&left>0;i++){float n=fminf(left,lens[i]);XeRect q=s[i];if(i==1)q.h=n;else if(i==2){q.w=n;q.x=r.x+r.w-n;}else if(i==3){q.h=n;q.y=r.y+r.h-n;}else q.w=n;xe_r_rect(q,rad,c);left-=n;}}
+void xe_r_border(XeRect r,float rad,float width,XeColor c){if(width<=0)return;bind_texture(0);g_ring=width;quad(r,rad,c,c,0,0,0,0,0,0,1,1);g_ring=0;}
+/* Rotated shape: a quad of half size (hw,hh) around (cx,cy), rotated by (ca,sa), with SDF params in its own frame. */
+static void shape_quad(float cx,float cy,float hw,float hh,float ca,float sa,float mode,float p0,float p1,float corner,float sc_s,float sc_c,XeColor c){
+ Layer l={0,0,1,1};int i;if(layer_n)l=layers[layer_n-1];
+ cx=cx*l.scale+l.tx;cy=cy*l.scale+l.ty;hw*=l.scale;hh*=l.scale;p0*=l.scale;p1*=l.scale;corner*=l.scale;c=premul(c,l.alpha);
+ hw+=1.5f;hh+=1.5f;   /* room for anti-aliasing */
+ {float lc[6][2]={{-hw,-hh},{hw,-hh},{hw,hh},{-hw,-hh},{hw,hh},{-hw,hh}};
+ if(vcount+6>XE_BATCH_QUADS*6)flush();
+ for(i=0;i<6;i++){Vertex *v=&verts[vcount++];float lx=lc[i][0],ly=lc[i][1];v->x=cx+lx*ca-ly*sa;v->y=cy+lx*sa+ly*ca;v->u=v->v=0;v->r=c.r;v->g=c.g;v->b=c.b;v->a=c.a;v->shape_x=lx;v->shape_y=ly;v->half_w=p0;v->half_h=p1;v->corner=corner;v->mode=mode;v->ring=0;v->sc_s=sc_s;v->sc_c=sc_c;}}
+}
+void xe_r_line(float x0,float y0,float x1,float y1,float width,XeColor c){float dx=x1-x0,dy=y1-y0,len=sqrtf(dx*dx+dy*dy);if(width<=0)return;bind_texture(0);if(len<0.001f){dx=1;dy=0;len=0;}else{dx/=len;dy/=len;}
+ /* a capsule: rounded ends */
+ shape_quad((x0+x1)*.5f,(y0+y1)*.5f,len*.5f+width*.5f,width*.5f,dx,dy,0,len*.5f+width*.5f,width*.5f,width*.5f,0,0,c);}
+/* Arc of a circle centred at (cx,cy): from angle a0 to a1 (radians, 0 = +x, clockwise on screen), stroke width w. */
+void xe_r_arc(float cx,float cy,float radius,float a0,float a1,float width,XeColor c){float half,mid,ext;if(width<=0||radius<=0)return;if(a1<a0){float s=a0;a0=a1;a1=s;}half=(a1-a0)*.5f;if(half<=0)return;if(half>3.14159265f)half=3.14159265f;mid=(a0+a1)*.5f;bind_texture(0);ext=radius+width;
+ /* The shader's arc opens around its local +y axis; rotate local +y onto the middle direction. */
+ shape_quad(cx,cy,ext,ext,cosf(mid-1.5707963f),sinf(mid-1.5707963f),2,radius,width*.5f,0,sinf(half),cosf(half),c);}
+/* Progress around a rounded rectangle, clockwise from the top centre. */
+void xe_r_border_progress(XeRect r,float rad,float width,float progress,XeColor c){
+ float x0,y0,x1,y1,seg[8],total=0,left;int i;if(progress<=0||width<=0)return;if(progress>1)progress=1;
+ rad=fmaxf(0,fminf(rad,fminf(r.w,r.h)*.5f));
+ x0=r.x+width*.5f;y0=r.y+width*.5f;x1=r.x+r.w-width*.5f;y1=r.y+r.h-width*.5f;rad=fmaxf(0,rad-width*.5f);
+ {float sw=(x1-x0)-2*rad,sh=(y1-y0)-2*rad,q=1.5707963f*rad;seg[0]=sw*.5f;seg[1]=q;seg[2]=sh;seg[3]=q;seg[4]=sw;seg[5]=q;seg[6]=sh;seg[7]=q;}
+ for(i=0;i<8;i++)total+=seg[i];left=progress*total;
+ for(i=0;i<8&&left>0;i++){float n=fminf(left,seg[i]),f=seg[i]>0?n/seg[i]:0;left-=n;if(n<=0)continue;
+  switch(i){
+  case 0:{float sx=(x0+x1)*.5f;xe_r_line(sx,y0,sx+n,y0,width,c);}break;
+  case 1:xe_r_arc(x1-rad,y0+rad,rad,-1.5707963f,-1.5707963f+1.5707963f*f,width,c);break;
+  case 2:xe_r_line(x1,y0+rad,x1,y0+rad+n,width,c);break;
+  case 3:xe_r_arc(x1-rad,y1-rad,rad,0,1.5707963f*f,width,c);break;
+  case 4:xe_r_line(x1-rad,y1,x1-rad-n,y1,width,c);break;
+  case 5:xe_r_arc(x0+rad,y1-rad,rad,1.5707963f,1.5707963f+1.5707963f*f,width,c);break;
+  case 6:xe_r_line(x0,y1-rad,x0,y1-rad-n,width,c);break;
+  case 7:xe_r_arc(x0+rad,y0+rad,rad,3.14159265f,3.14159265f+1.5707963f*f,width,c);break;
+  }}
+ /* the last stretch of the top edge, from the top-left corner back to the centre */
+ if(left>0){float n=fminf(left,(x1-x0)*.5f-rad);xe_r_line(x0+rad,y0,x0+rad+n,y0,width,c);}
+}
 void xe_r_glow(XeRect r,float rad,float spread,XeColor c){if(spread<=0){xe_r_rect(r,rad,c);return;}/* Layered translucent shells; no offscreen blur pass. */for(int i=5;i>=1;i--){float t=(float)i/5.0f;XeRect q={r.x-spread*t,r.y-spread*t,r.w+2*spread*t,r.h+2*spread*t};XeColor cc=c;cc.a*=0.045f*(6-i);xe_r_rect(q,rad+spread*t,cc);}xe_r_rect(r,rad,c);}
 void xe_r_image(const XeTexture *t,XeRect dst,float rad,float alpha,int contain){if(!t||!t->id)return;bind_texture(t->id);float u0=0,v0=0,u1=1,v1=1;if(contain){float ar=(float)t->w/(float)(t->h?t->h:1),dr=dst.w/(dst.h?dst.h:1);if(ar>dr){float hh=dr/ar;v0=(1-hh)*.5f;v1=1-v0;}else{float ww=ar/dr;u0=(1-ww)*.5f;u1=1-u0;}}XeColor c={1,1,1,alpha};quad(dst,rad,c,c,0,1,0,0,u0,v0,u1,v1);}
 void xe_r_image_tint(const XeTexture *t,XeRect dst,float rad,XeColor tint,float u0,float v0,float u1,float v1){if(!t||!t->id)return;bind_texture(t->id);quad(dst,rad,tint,tint,0,1,0,0,u0,v0,u1,v1);}
 void xe_r_image_blurred(const XeTexture *t,XeRect dst,float strength,float alpha){(void)strength;/* safe low-cost fallback until an offscreen framebuffer cache is available */xe_r_image(t,dst,0,alpha,0);}
-void xe_r_line(float x0,float y0,float x1,float y1,float width,XeColor c){float dx=x1-x0,dy=y1-y0,len=sqrtf(dx*dx+dy*dy);if(len<0.001f)return;float nx=-dy/len*width*.5f,ny=dx/len*width*.5f;/* Represent as a rotated quad using four thin rectangles is intentionally avoided; axis-aligned fallback for robust GLES2 batching. */if(fabsf(dx)>=fabsf(dy))xe_r_rect((XeRect){fminf(x0,x1),fminf(y0,y1)-width*.5f,fabsf(dx),width},width*.5f,c);else xe_r_rect((XeRect){fminf(x0,x1)-width*.5f,fminf(y0,y1),width,fabsf(dy)},width*.5f,c);(void)nx;(void)ny;}
 float xe_r_current_scale(void){return layer_n?layers[layer_n-1].scale:1.0f;}
 void xe_r_push_clip(XeRect r,float radius){(void)radius;if(clip_n>=XE_CLIP_MAX)return;if(layer_n){Layer l=layers[layer_n-1];r.x=r.x*l.scale+l.tx;r.y=r.y*l.scale+l.ty;r.w*=l.scale;r.h*=l.scale;}flush();clips[clip_n++]=(Clip){r,radius};if(clip_n==1){current_clip=r;has_clip=1;}else{float x=fmaxf(current_clip.x,r.x),y=fmaxf(current_clip.y,r.y),right=fminf(current_clip.x+current_clip.w,r.x+r.w),bottom=fminf(current_clip.y+current_clip.h,r.y+r.h);current_clip=(XeRect){x,y,fmaxf(0,right-x),fmaxf(0,bottom-y)};}glEnable(GL_SCISSOR_TEST);glScissor((int)current_clip.x,(int)(fbh-current_clip.y-current_clip.h),(int)current_clip.w,(int)current_clip.h);}
 void xe_r_pop_clip(void){if(!clip_n)return;flush();clip_n--;has_clip=clip_n>0;if(!has_clip)glDisable(GL_SCISSOR_TEST);else{current_clip=clips[0].r;for(int i=1;i<clip_n;i++){XeRect r=clips[i].r;float x=fmaxf(current_clip.x,r.x),y=fmaxf(current_clip.y,r.y),rr=fminf(current_clip.x+current_clip.w,r.x+r.w),bb=fminf(current_clip.y+current_clip.h,r.y+r.h);current_clip=(XeRect){x,y,fmaxf(0,rr-x),fmaxf(0,bb-y)};}glScissor((int)current_clip.x,(int)(fbh-current_clip.y-current_clip.h),(int)current_clip.w,(int)current_clip.h);}}

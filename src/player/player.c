@@ -6,6 +6,7 @@
 #if !defined(__ANDROID__)
 #include "xe/player.h"
 #include "xe/platform.h"
+#include "xe/jobs.h"
 #include <mpv/client.h>
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #ifdef _WIN32
 #define strtok_r strtok_s
 #define WIN32_LEAN_AND_MEAN
@@ -92,7 +94,7 @@ static char g_err[160];
 static void on_update(void *ctx) { (void)ctx; }
 
 /* mpv wants "Name: value" entries separated by commas; commas inside values are escaped. */
-static void set_headers(const char *const *h)
+static void set_headers(mpv_handle *mpv, const char *const *h)
 {
     char buf[4096];
     size_t n = 0;
@@ -107,10 +109,10 @@ static void set_headers(const char *const *h)
             if (*v != '\n' && *v != '\r') buf[n++] = *v;
         }
         buf[n] = 0;
-        if (!strcmp(h[i], "User-Agent")) M.set_option_string(g_mpv, "user-agent", h[i + 1]);
-        if (!strcmp(h[i], "Referer")) M.set_option_string(g_mpv, "referrer", h[i + 1]);
+        if (!strcmp(h[i], "User-Agent")) M.set_option_string(mpv, "user-agent", h[i + 1]);
+        if (!strcmp(h[i], "Referer")) M.set_option_string(mpv, "referrer", h[i + 1]);
     }
-    if (n) M.set_option_string(g_mpv, "http-header-fields", buf);
+    if (n) M.set_option_string(mpv, "http-header-fields", buf);
 }
 
 static void destroy(void)
@@ -120,6 +122,7 @@ static void destroy(void)
     g_active = 0; g_loaded_file = 0;
 }
 
+static void preview_source(const char *url, const char *const *headers);
 void xe_player_open(const char *url, const char *const *headers, double start_sec)
 {
     const char *cmd[] = { "loadfile", url, NULL };
@@ -149,7 +152,8 @@ void xe_player_open(const char *url, const char *const *headers, double start_se
     }
     M.set_option_string(g_mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Xstream");
     if (start_sec > 1) { char s[48]; snprintf(s, sizeof s, "%.3f", start_sec); M.set_option_string(g_mpv, "start", s); }
-    set_headers(headers);
+    set_headers(g_mpv, headers);
+    preview_source(url, headers);
     if (M.initialize(g_mpv) < 0) { destroy(); g_error = 1; snprintf(g_err, sizeof g_err, "Could not start the video engine"); g_active = 1; return; }
     {
         mpv_opengl_init_params gl = { gl_proc, NULL };
@@ -184,7 +188,7 @@ void xe_player_seek(double sec)
     M.command_async(g_mpv, 0, cmd);
 }
 
-void xe_player_close(void) { if (g_loaded == 1) destroy(); g_active = 0; }
+void xe_player_close(void) { if (g_loaded == 1) destroy(); g_active = 0; preview_source(NULL, NULL); }
 int xe_player_active(void) { return g_active; }
 const char *xe_player_error(void) { return g_error ? g_err : NULL; }
 
@@ -269,5 +273,127 @@ void xe_player_render_video(int w, int h)
         M.render_context_update(g_rc);
         M.render_context_render(g_rc, rp);
     }
+}
+/* ---------------------------------------------------------------- seek previews
+ * A second, silent mpv opens the same stream on a worker thread, jumps to the nearest keyframe and draws one
+ * small frame with mpv's software renderer into memory. One job at a time; the texture is made on the render
+ * thread. A generation number drops frames that arrive after the video changed or closed. */
+#define PV_BUCKET 10.0
+#define PV_W 320
+#define PV_H 180
+typedef struct { char *url; char *hdr[33]; double sec; int bucket; unsigned gen; unsigned char *rgba; int ok; } PvJob;
+static char *pv_url, *pv_hdr[33];
+static unsigned pv_gen = 1;
+static int pv_busy, pv_tex_bucket = -1, pv_new_bucket = -1;
+static unsigned char *pv_new;
+static double pv_shown, pv_new_shown;
+static XeTexture *pv_tex;
+static char *pv_dup(const char *s) { size_t n; char *p; if (!s) return NULL; n = strlen(s) + 1; p = (char *)malloc(n); if (p) memcpy(p, s, n); return p; }
+
+static void preview_source(const char *url, const char *const *headers)
+{
+    int i;
+    pv_gen++;
+    free(pv_url); pv_url = pv_dup(url);
+    for (i = 0; i < 33; i++) { free(pv_hdr[i]); pv_hdr[i] = NULL; }
+    for (i = 0; headers && headers[i] && i < 32; i++) pv_hdr[i] = pv_dup(headers[i]);
+    free(pv_new); pv_new = NULL; pv_new_bucket = -1;
+    if (pv_tex) { xe_tex_destroy(pv_tex); pv_tex = NULL; }   /* both run on the render thread */
+    pv_tex_bucket = -1;
+}
+
+static void pv_wakeup(void *ctx) { (void)ctx; }
+
+static void preview_work(void *arg)
+{
+    PvJob *j = (PvJob *)arg;
+    mpv_handle *mpv;
+    mpv_render_context *rc = NULL;
+    char start[48];
+    const char *cmd[] = { "loadfile", j->url, NULL };
+    int i, got = 0;
+    if (!load_mpv() || !(mpv = M.create())) return;
+    M.set_option_string(mpv, "vo", "libmpv");
+    M.set_option_string(mpv, "ao", "null");
+    M.set_option_string(mpv, "audio", "no");
+    M.set_option_string(mpv, "hwdec", "no");
+    M.set_option_string(mpv, "pause", "yes");
+    M.set_option_string(mpv, "hr-seek", "no");
+    M.set_option_string(mpv, "cache", "no");
+    M.set_option_string(mpv, "hls-bitrate", "min");
+    M.set_option_string(mpv, "ytdl", "no");
+    M.set_option_string(mpv, "osd-level", "0");
+    M.set_option_string(mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Xstream");
+    snprintf(start, sizeof start, "%.3f", j->sec);
+    M.set_option_string(mpv, "start", start);
+    set_headers(mpv, (const char *const *)j->hdr);
+    if (M.initialize(mpv) < 0) { M.terminate_destroy(mpv); return; }
+    {
+        mpv_render_param params[] = {
+            { MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_SW },
+            { MPV_RENDER_PARAM_INVALID, NULL } };
+        if (M.render_context_create(&rc, mpv, params) < 0) { M.terminate_destroy(mpv); return; }
+        M.render_context_set_update_callback(rc, pv_wakeup, NULL);
+    }
+    M.command(mpv, cmd);
+    /* Up to ~12 s for the first frame at that time. */
+    for (i = 0; i < 240 && !got; i++) {
+        mpv_event *e = M.wait_event(mpv, 0.05);
+        if (e && e->event_id == MPV_EVENT_END_FILE) break;
+        if (j->gen != pv_gen) break;          /* the video changed: give up early */
+        if (M.render_context_update(rc) & MPV_RENDER_UPDATE_FRAME) {
+            int size[2] = { PV_W, PV_H };
+            size_t stride = PV_W * 4;
+            unsigned char *px = (unsigned char *)malloc((size_t)PV_W * PV_H * 4);
+            mpv_render_param rp[] = {
+                { MPV_RENDER_PARAM_SW_SIZE, size }, { MPV_RENDER_PARAM_SW_FORMAT, (void *)"rgb0" },
+                { MPV_RENDER_PARAM_SW_STRIDE, &stride }, { MPV_RENDER_PARAM_SW_POINTER, px },
+                { MPV_RENDER_PARAM_INVALID, NULL } };
+            if (px && M.render_context_render(rc, rp) >= 0) {
+                int k;
+                for (k = 0; k < PV_W * PV_H; k++) px[k * 4 + 3] = 255;
+                j->rgba = px; j->ok = 1; got = 1;
+            } else free(px);
+        }
+    }
+    M.render_context_set_update_callback(rc, NULL, NULL);
+    M.render_context_free(rc);
+    M.terminate_destroy(mpv);
+}
+
+static void preview_done(void *arg)
+{
+    PvJob *j = (PvJob *)arg;
+    int i;
+    pv_busy = 0;
+    if (j->ok && j->gen == pv_gen) { free(pv_new); pv_new = j->rgba; j->rgba = NULL; pv_new_bucket = j->bucket; pv_new_shown = j->sec; }
+    free(j->rgba); free(j->url);
+    for (i = 0; i < 33; i++) free(j->hdr[i]);
+    free(j);
+}
+
+const XeTexture *xe_player_preview(double sec, double *shown_sec)
+{
+    int bucket;
+    if (shown_sec) *shown_sec = 0;
+    if (!isfinite(sec) || sec < 0 || !pv_url) return NULL;
+    bucket = (int)(sec / PV_BUCKET);
+    if (pv_new) {
+        if (!pv_tex) pv_tex = xe_tex_create(PV_W, PV_H, pv_new); else xe_tex_update(pv_tex, pv_new);
+        free(pv_new); pv_new = NULL; pv_tex_bucket = pv_new_bucket; pv_shown = pv_new_shown;
+    }
+    if (bucket != pv_tex_bucket && !pv_busy && g_loaded == 1) {
+        PvJob *j = (PvJob *)calloc(1, sizeof *j);
+        int i;
+        if (j && (j->url = pv_dup(pv_url))) {
+            for (i = 0; pv_hdr[i] && i < 32; i++) j->hdr[i] = pv_dup(pv_hdr[i]);
+            j->bucket = bucket; j->sec = bucket * PV_BUCKET; j->gen = pv_gen;
+            pv_busy = 1;
+            xe_jobs_submit(preview_work, preview_done, j, 0);
+        } else free(j);
+    }
+    if (!pv_tex) return NULL;
+    if (shown_sec) *shown_sec = pv_shown;
+    return pv_tex;
 }
 #endif

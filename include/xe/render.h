@@ -24,7 +24,9 @@ void xe_r_image(const XeTexture *t, XeRect dst, float radius, float alpha, int c
 /* Draws the texture area (u0,v0)-(u1,v1) multiplied by tint; used for glyphs and icons. */
 void xe_r_image_tint(const XeTexture *t, XeRect dst, float radius, XeColor tint, float u0, float v0, float u1, float v1);
 void xe_r_image_blurred(const XeTexture *t, XeRect dst, float strength, float alpha);
-void xe_r_line(float x0, float y0, float x1, float y1, float width, XeColor c);
+void xe_r_line(float x0, float y0, float x1, float y1, float width, XeColor c);   /* round caps, any angle */
+/* Stroke along a circle: angles in radians, 0 = right, growing clockwise on screen. */
+void xe_r_arc(float cx, float cy, float radius, float a0, float a1, float width, XeColor c);
 void xe_r_push_clip(XeRect r, float radius); void xe_r_pop_clip(void);
 void xe_r_push_layer(float tx, float ty, float scale, float alpha); void xe_r_pop_layer(void);
 /* Scale of the innermost layer (1 when none); text uses it to rasterise crisply. */
