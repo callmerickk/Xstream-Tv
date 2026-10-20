@@ -4,6 +4,11 @@ on:
     branches: [ main ]
     paths: [ "android/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/android.yml" ]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Attach the APK to the latest Xstream TV release"
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency:
@@ -24,7 +29,16 @@ jobs:
           set -o pipefail
           mkdir -p ../out
           gradle --no-daemon assembleRelease 2>&1 | tee ../out/build.log
-          cp app/build/outputs/apk/release/*.apk ../out/ 2>/dev/null || true
+          cp app/build/outputs/apk/release/*.apk ../out/Xstream-TV-android.apk
+      - uses: actions/upload-artifact@v4
+        with: { name: Xstream-TV-android, path: out/Xstream-TV-android.apk }
+      - name: Attach the APK to the latest release
+        if: github.event.inputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/${{ github.repository }}/releases/latest -q .tag_name)
+          gh release upload "$tag" out/Xstream-TV-android.apk --clobber -R ${{ github.repository }}
       - name: Report errors
         if: failure()
         run: |

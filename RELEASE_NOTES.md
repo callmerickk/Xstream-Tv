@@ -1,5 +1,6 @@
-Xstream TV for Windows, early preview. Two downloads, both native (no emulation):
+Xstream TV, early preview (written in C). Downloads:
 
+- **Xstream-TV-android.apk**: Android phones, tablets and Android TV / Fire TV (one app, adapts to the screen)
 - **Xstream-TV-windows-x64.zip**: Intel and AMD PCs
 - **Xstream-TV-windows-arm64.zip**: Snapdragon / ARM PCs
 

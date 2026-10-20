@@ -16,7 +16,9 @@ android {
     }
     // The fonts are shared with the desktop app.
     sourceSets["main"].assets.srcDirs("../../assets")
-    buildTypes { release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("debug") } }
+    // One fixed key, so each new APK installs over the previous one.
+    signingConfigs { create("xstream") { storeFile = file("../xstreamtv.keystore"); storePassword = "xstreamtv"; keyAlias = "xstreamtv"; keyPassword = "xstreamtv" } }
+    buildTypes { release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("xstream") } }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
 }
