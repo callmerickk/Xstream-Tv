@@ -136,6 +136,7 @@ void xe_player_open(const char *url, const char *const *headers, double start_se
     M.set_option_string(g_mpv, "keep-open", "yes");
     M.set_option_string(g_mpv, "sub-auto", "fuzzy");
     M.set_option_string(g_mpv, "osd-level", "0");
+    if (getenv("XE_MPV_LOG")) M.set_option_string(g_mpv, "log-file", getenv("XE_MPV_LOG"));
     if (getenv("XE_MPV_AO")) M.set_option_string(g_mpv, "ao", getenv("XE_MPV_AO"));
     M.set_option_string(g_mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Xstream");
     if (start_sec > 1) { char s[48]; snprintf(s, sizeof s, "%.3f", start_sec); M.set_option_string(g_mpv, "start", s); }
@@ -221,8 +222,9 @@ int xe_player_tracks(int kind, char names[][64], int max)
                 else if (!strcmp(k, "selected") && v->format == MPV_FORMAT_FLAG) sel = v->u.flag;
             }
             if (!type || strcmp(type, kinds[kind])) continue;
-            snprintf(names[n++], 64, "%s%s%s%s", title ? title : (lang ? lang : "Track"),
-                     title && lang ? " · " : "", title && lang ? lang : "", sel ? "  \xE2\x80\xA2" : "");
+            { char fallback[24]; snprintf(fallback, sizeof fallback, "%s %d", kind == 0 ? "Audio" : kind == 1 ? "Subtitle" : "Video", n + 1);
+            snprintf(names[n++], 64, "%s%s%s%s", title ? title : (lang ? lang : fallback),
+                     title && lang ? " · " : "", title && lang ? lang : "", sel ? "  \xE2\x80\xA2" : ""); }
         }
     M.free_node_contents(&list);
     return n;
