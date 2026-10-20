@@ -93,8 +93,8 @@ class XePlayer(private val context: Context, private val root: FrameLayout, priv
             override fun onIsPlayingChanged(isPlaying: Boolean) { paused = if (isPlaying) 0 else 1; pushSnapshot() }
             override fun onPlayerError(playbackException: PlaybackException) {
                 error = when (playbackException.errorCode) {
-                    PlaybackException.ERROR_CODE_NETWORK_CONNECTION_FAILED,
-                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> "Network connection failed. Check your connection and try again."
+                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> "Network connection failed. Check your connection and try again."
                     PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "The stream server rejected the request."
                     PlaybackException.ERROR_CODE_DECODING_FAILED,
                     PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED -> "This video format is not supported."

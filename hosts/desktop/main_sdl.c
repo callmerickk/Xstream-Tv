@@ -289,7 +289,7 @@ int main(int argc, char **argv)
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    win = SDL_CreateWindow("Xstream", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
+    win = SDL_CreateWindow("Xstream TV", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win) {
         xe_log(3, "SDL_CreateWindow failed: %s", SDL_GetError());
@@ -326,6 +326,13 @@ int main(int argc, char **argv)
         char dir[1100];
         snprintf(dir, sizeof dir, "%sassets", base ? base : "");
         xe_platform_set_asset_dir(dir);
+        {   /* the Xstream mark as the window / taskbar icon */
+            char icon[1200];
+            SDL_Surface *ic;
+            snprintf(icon, sizeof icon, "%s/brand/icon-128.bmp", dir);
+            ic = SDL_LoadBMP(icon);
+            if (ic) { SDL_SetWindowIcon(win, ic); SDL_FreeSurface(ic); }
+        }
         if (base) SDL_free(base);
     }
     update_size(win, 1);

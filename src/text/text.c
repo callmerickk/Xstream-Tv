@@ -482,6 +482,12 @@ XeFont *xe_font_get(float pxf, int weight)
     if (px < 6) px = 6;
     if (weight <= 0) weight = 400;
     for (i = 0; i < g_nsized; i++) if (g_sized[i].px == px && g_sized[i].weight == weight) return g_sized[i].font;
+    if (weight == XE_FONT_BRAND) {         /* Poppins Bold: the Xstream wordmark */
+        f = font_load_weight("fonts/Poppins-Bold.ttf", (float)px, 0);
+        if (!f) f = font_load_weight(k_main, (float)px, 700);
+        if (f && g_nsized < (int)(sizeof g_sized / sizeof g_sized[0])) { g_sized[g_nsized].px = px; g_sized[g_nsized].weight = weight; g_sized[g_nsized].font = f; g_nsized++; }
+        return f;
+    }
     f = font_load_weight(k_main, (float)px, weight);
     if (!f) return NULL;
     for (i = 0; i < (int)(sizeof k_fallbacks / sizeof k_fallbacks[0]); i++) {

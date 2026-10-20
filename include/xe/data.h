@@ -11,7 +11,7 @@ typedef struct {
     char **genres;
     int n_genres;
 } XeMeta;
-typedef struct { char *title; XeMeta *items; int n; } XeShelf;
+typedef struct { char *title; XeMeta *items; int n; char *addon_base; } XeShelf;
 typedef struct {
     char *addon, *url, *name, *title, *filename;
     long long size;
@@ -27,6 +27,9 @@ void xe_data_pump(void); /* convenience: call xe_net_pump() then internal pump *
 void xe_data_home(void (*cb)(XeShelf *shelves, int n, void *u), void *u);
 void xe_data_meta(const char *type, const char *id,
                   void (*cb)(XeMeta *m, XeEpisode *eps, int n_eps, void *u), void *u);
+/* Next page of a home shelf (addon_base from XeShelf). The callback owns the items. */
+void xe_data_catalog_more(const char *addon_base, const char *type, const char *catalog_id, int skip,
+                          void (*cb)(XeMeta *items, int n, void *u), void *u);
 void xe_data_search(const char *q, void (*cb)(XeMeta *res, int n, void *u), void *u);
 void xe_data_streams(const char *type, const char *id,
                      void (*cb)(XeStream *s, int n, int finished, void *u), void *u);

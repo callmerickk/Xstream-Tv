@@ -20,7 +20,9 @@ void xe_text_draw(XeFont *f, const char *utf8, float x, float y, float max_w, in
 void xe_text_shutdown(void);
 
 /* App-level labels using the bundled Noto Sans family with Indic fallbacks.
- * weight: 400 regular, 500 medium, 600 semibold, 700 bold. Fonts are cached per size. */
+ * weight: 400 regular, 500 medium, 600 semibold, 700 bold. Fonts are cached per size.
+ * XE_FONT_BRAND selects Poppins Bold, the Xstream wordmark font. */
+#define XE_FONT_BRAND 1000
 XeFont *xe_font_get(float px, int weight);
 void xe_label(const char *utf8, float x, float y, float px, XeColor c);
 void xe_label_w(const char *utf8, float x, float y, float px, int weight, XeColor c);

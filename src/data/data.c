@@ -43,7 +43,7 @@ static void free_meta_fields(XeMeta *m) {
 void xe_data_free_meta(XeMeta *m) { if(m){free_meta_fields(m);free(m);} }
 void xe_data_free_metas(XeMeta *a,int n) { int i;if(!a)return;for(i=0;i<n;i++)free_meta_fields(&a[i]);free(a); }
 void xe_data_free_episodes(XeEpisode *a,int n) { int i;if(!a)return;for(i=0;i<n;i++){free(a[i].id);free(a[i].title);free(a[i].thumb);}free(a); }
-void xe_data_free_shelves(XeShelf *a,int n) { int i;if(!a)return;for(i=0;i<n;i++){free(a[i].title);xe_data_free_metas(a[i].items,a[i].n);}free(a); }
+void xe_data_free_shelves(XeShelf *a,int n) { int i;if(!a)return;for(i=0;i<n;i++){free(a[i].title);free(a[i].addon_base);xe_data_free_metas(a[i].items,a[i].n);}free(a); }
 void xe_data_free_streams(XeStream *a,int n) { int i,j;if(!a)return;for(i=0;i<n;i++){free(a[i].addon);free(a[i].url);free(a[i].name);free(a[i].title);free(a[i].filename);for(j=0;j<a[i].n_headers;j++)free(a[i].headers[j]);free(a[i].headers);}free(a); }
 
 static const char *jstr(const void *o,const char *k) { return xe_json_str(o,k); }
@@ -76,7 +76,7 @@ static void http_done(const XeHttpResponse *r,void *u) {
 }
 static int get_url(const char *url,void (*done)(const XeHttpResponse *,void *),void *user) {
     CacheEntry *e=cache_find(url);ReqCtx *c;
-    if(e){XeHttpResponse r;memset(&r,0,sizeof(r));r.status=200;r.body=e->body;r.len=e->len;r.final_url=(char*)url;r.content_type="application/json";if(done)done(&r,user);return 0;}
+    if(e){XeHttpResponse r;memset(&r,0,sizeof(r));r.status=200;r.body=e->body;r.len=e->len;r.final_url=(char*)url;r.content_type="application/json";if(done)done(&r,user);return 1;}  /* answered from the cache */
     c=(ReqCtx*)calloc(1,sizeof(*c));if(!c)return 0;c->url=dup_s(url);c->done=done;c->user=user;
     if(!c->url||!xe_http_get(url,NULL,http_done,c)){free(c->url);free(c);return 0;}return 1;
 }
@@ -108,17 +108,23 @@ static long long parse_size(const char *s) {
     const char *p=s; if(!s)return 0;while(*p){if(isdigit((unsigned char)*p)){char *end;double v=strtod(p,&end);while(*end==' '||*end=='\t')end++;if((end[0]=='G'||end[0]=='g')&&(end[1]=='B'||end[1]=='b'))return (long long)(v*1024.0*1024.0*1024.0);if((end[0]=='M'||end[0]=='m')&&(end[1]=='B'||end[1]=='b'))return (long long)(v*1024.0*1024.0);if((end[0]=='K'||end[0]=='k')&&(end[1]=='B'||end[1]=='b'))return (long long)(v*1024.0);p=end;}else p++;}return 0;
 }
 static int download_only(const char *s) { return contains_ci(s,"instant download")||contains_ci(s,"10gbps"); }
-static char *stream_field(const void *o,const char *k) { return dup_s(jstr(o,k)); }
+/* behaviorHints.proxyHeaders.request: the headers a stream needs (name/value pairs, as the player expects). */
+static void stream_headers(XeStream *s,const void *bh) {
+    static const char *keys[]={"User-Agent","Referer","Origin","Cookie","Authorization","Accept","X-Requested-With","user-agent","referer","origin","cookie","authorization","accept","x-requested-with"};
+    void *req=xe_json_obj_get(xe_json_obj_get(bh,"proxyHeaders"),"request");int i,j,n=0;char **v;
+    if(!req)return;v=(char**)calloc(16,sizeof(char*));if(!v)return;
+    for(i=0;i<(int)(sizeof(keys)/sizeof(keys[0]));i++){const char *x=jstr(req,keys[i]);int dup=0;if(!x||!*x)continue;for(j=0;j<n;j+=2)if(!strncasecmp(v[j],keys[i],strlen(keys[i])+1))dup=1;if(!dup&&n<14){v[n++]=dup_s(keys[i]);v[n++]=dup_s(x);}}
+    if(n){s->headers=v;s->n_headers=n;}else free(v);
+}
 static XeStream *streams_parse(const void *arr,const char *addon,int *out_n) {
     int i,n=xe_json_arr_len(arr),count=0;XeStream *a;if(out_n)*out_n=0;if(n<1)return NULL;if(n>MAX_ITEMS)n=MAX_ITEMS;
     a=(XeStream*)calloc((size_t)n,sizeof(*a));if(!a)return NULL;
     for(i=0;i<n;i++){void *o=xe_json_at(arr,i);const char *url=jstr(o,"url"),*name=jstr(o,"name"),*title=jstr(o,"title");void *bh;const char *fn=NULL;XeStream *s;
-        if(!url||!*url||download_only(name)||download_only(title)||download_only(url))continue;
+        if(!url||!*url||download_only(name)||download_only(title)||download_only(url)||jstr(o,"externalUrl")||jstr(o,"infoHash"))continue;
         bh=xe_json_obj_get(o,"behaviorHints");fn=jstr(bh,"filename");if(download_only(fn))continue;
         s=&a[count];s->addon=dup_s(addon);s->url=dup_s(url);s->name=dup_s(name);s->title=dup_s(title);s->filename=dup_s(fn);s->height=parse_height(name);if(!s->height)s->height=parse_height(title);if(!s->height)s->height=parse_height(fn);s->size=parse_size(name);if(!s->size)s->size=parse_size(title);if(!s->size)s->size=parse_size(fn);
-        {void *ph=xe_json_obj_get(bh,"proxyHeaders"),*rq=xe_json_obj_get(ph,"request");int h=0,j;const char *key;for(j=0;j<64;j++){char keybuf[16];snprintf(keybuf,sizeof(keybuf),"%d",j);(void)keybuf;} /* header objects are copied below via cJSON's known object iterator is intentionally avoided by P6 API */
-            (void)rq;(void)h;(void)key;
-        } count++;
+        stream_headers(s,bh);
+        count++;
     }
     if(!count){free(a);return NULL;}if(out_n)*out_n=count;return a;
 }
@@ -127,7 +133,7 @@ static XeStream *streams_parse(const void *arr,const char *addon,int *out_n) {
  * Shelves come back in manifest order once every request has finished. */
 typedef struct { char *type,*id,*name; } Catalog;
 typedef struct { void (*cb)(XeShelf*,int,void*);void *user;XeShelf *shelves;int *order;int n_shelves,pending; } HomeCtx;
-typedef struct { HomeCtx *home; Catalog cat; char *url; int order; } CatCtx;
+typedef struct { HomeCtx *home; Catalog cat; char *url, *base; int order; } CatCtx;
 typedef struct { HomeCtx *home; Addon *addon; int index; } ManCtx;
 static int catalog_needs_input(const void *c) {
     void *req=xe_json_obj_get(c,"extraRequired"),*extra=xe_json_obj_get(c,"extra");int i,n;
@@ -151,11 +157,11 @@ static void catalog_response(const XeHttpResponse *r,void *u) {
             if(p&&o){XeShelf *s=&p[h->n_shelves];char title[300];memset(s,0,sizeof(*s));
                 if(c->cat.name&&c->cat.type&&(!strcmp(c->cat.type,"movie")||!strcmp(c->cat.type,"series")))snprintf(title,sizeof(title),"%s %s",c->cat.name,!strcmp(c->cat.type,"movie")?"Movies":"Series");
                 else snprintf(title,sizeof(title),"%s",c->cat.name?c->cat.name:c->cat.id);
-                s->title=dup_s(title);s->items=(XeMeta*)calloc((size_t)n,sizeof(XeMeta));
+                s->title=dup_s(title);s->addon_base=dup_s(c->base);s->items=(XeMeta*)calloc((size_t)n,sizeof(XeMeta));
                 if(s->items){for(i=0;i<n;i++)meta_from_json(&s->items[i],xe_json_at(metas,i),c->cat.type);s->n=n;o[h->n_shelves]=c->order;h->n_shelves++;}else free(s->title);}}
         if(root)xe_json_delete(root);
     }
-    free(c->cat.type);free(c->cat.id);free(c->cat.name);free(c->url);free(c);
+    free(c->cat.type);free(c->cat.id);free(c->cat.name);free(c->url);free(c->base);free(c);
     if(h->pending>0)h->pending--;
     if(h->pending==0)home_finish(h);
 }
@@ -179,9 +185,9 @@ static void manifest_cb(const XeHttpResponse *r,void *u) {
                 if(!type||!id||catalog_needs_input(c))continue;
                 snprintf(path,sizeof(path),"catalog/%s/%s.json",type,id);url=join_url(a->base,path);if(!url)continue;
                 cc=(CatCtx*)calloc(1,sizeof(*cc));if(!cc){free(url);continue;}
-                cc->home=h;cc->cat.type=dup_s(type);cc->cat.id=dup_s(id);cc->cat.name=dup_s(name?name:id);cc->url=url;cc->order=mc->index*100+i;
+                cc->home=h;cc->cat.type=dup_s(type);cc->cat.id=dup_s(id);cc->cat.name=dup_s(name?name:id);cc->url=url;cc->base=dup_s(a->base);cc->order=mc->index*100+i;
                 h->pending++;
-                if(!get_url(url,catalog_response,cc)){h->pending--;free(cc->cat.type);free(cc->cat.id);free(cc->cat.name);free(cc->url);free(cc);}
+                if(!get_url(url,catalog_response,cc)){h->pending--;free(cc->cat.type);free(cc->cat.id);free(cc->cat.name);free(cc->url);free(cc->base);free(cc);}
             }
         }
     }
@@ -222,3 +228,18 @@ void xe_data_streams(const char *type,const char *id,void (*cb)(XeStream*,int,in
     if(--c->pending==0){if(cb)cb(NULL,0,1,u);free(c->type);free(c->id);free(c->addon);free(c);}
 }
 void xe_data_internal_stream_cb(const XeHttpResponse *r,void *u) { typedef struct { StreamCtx *parent;char *addon; } SC;SC *sc=(SC*)u;StreamCtx *c=sc->parent;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){s=streams_parse(xe_json_obj_get(root,"streams"),sc->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;free(sc->addon);free(sc);if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }
+
+/* More of a home catalog: the next page (skip = items already shown). */
+typedef struct { void (*cb)(XeMeta*,int,void*); void *user; char *type; } MoreCtx;
+static void more_done(const XeHttpResponse *r,void *u) {
+    MoreCtx *c=(MoreCtx*)u;XeMeta *a=NULL;int n=0,i;void *root;
+    if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){void *metas=xe_json_obj_get(root,"metas");n=xe_json_arr_len(metas);if(n>MAX_ITEMS)n=MAX_ITEMS;
+        if(n>0){a=(XeMeta*)calloc((size_t)n,sizeof(XeMeta));if(a)for(i=0;i<n;i++)meta_from_json(&a[i],xe_json_at(metas,i),c->type);else n=0;}xe_json_delete(root);}
+    if(c->cb)c->cb(a,n,c->user);else xe_data_free_metas(a,n);free(c->type);free(c);
+}
+void xe_data_catalog_more(const char *base,const char *type,const char *id,int skip,void (*cb)(XeMeta*,int,void*),void *u) {
+    char path[1200];char *url;MoreCtx *c;if(!base||!type||!id){if(cb)cb(NULL,0,u);return;}if(skip<0)skip=0;
+    snprintf(path,sizeof(path),"catalog/%s/%s/skip=%d.json",type,id,skip);url=join_url(base,path);if(!url){if(cb)cb(NULL,0,u);return;}
+    c=(MoreCtx*)calloc(1,sizeof(*c));if(!c){free(url);if(cb)cb(NULL,0,u);return;}c->cb=cb;c->user=u;c->type=dup_s(type);
+    if(!get_url(url,more_done,c)){if(cb)cb(NULL,0,u);free(c->type);free(c);}free(url);
+}
