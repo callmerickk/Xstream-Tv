@@ -1,0 +1,34 @@
+name: Android build
+on:
+  push:
+    branches: [ main ]
+    paths: [ "android/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/android.yml" ]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.9" }
+      - name: Build APK
+        working-directory: android
+        run: |
+          set -o pipefail
+          mkdir -p ../out
+          gradle --no-daemon assembleRelease 2>&1 | tee ../out/build.log
+          cp app/build/outputs/apk/release/*.apk ../out/ 2>/dev/null || true
+      - name: Save logs to the ci-android branch
+        if: always()
+        run: |
+          cd out && rm -f *.apk
+          git init -q && git checkout -q -b ci-android
+          git add -A && git -c user.name=ci -c user.email=ci@local commit -qm "run ${{ github.run_number }}"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-android

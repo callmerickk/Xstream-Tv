@@ -1,4 +1,4 @@
-package com.streamx.xe
+package com.xe.xehost
 
 import android.app.Activity
 import android.widget.FrameLayout

@@ -1,4 +1,4 @@
-package com.streamx.xe
+package com.xe.xehost
 
 import android.content.Context
 import android.os.Handler
@@ -146,5 +146,5 @@ class XePlayer(
     fun close() { check(Looper.myLooper() == Looper.getMainLooper()); closeInternal(true) }
     private external fun nativePushSnapshot(handle: Long, pos: Double, dur: Double, buffering: Int, subtitle: String)
     private external fun nativePushTracks(handle: Long, kind: Int, names: Array<String>)
-    companion object { init { System.loadLibrary("xe") } }
+    companion object { init { System.loadLibrary("xe_android") } }
 }
