@@ -136,17 +136,16 @@ void xe_player_open(const char *url, const char *const *headers, double start_se
     M.set_option_string(g_mpv, "keep-open", "yes");
     M.set_option_string(g_mpv, "sub-auto", "fuzzy");
     M.set_option_string(g_mpv, "osd-level", "0");
+    if (getenv("XE_MPV_AO")) M.set_option_string(g_mpv, "ao", getenv("XE_MPV_AO"));
     M.set_option_string(g_mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Xstream");
     if (start_sec > 1) { char s[48]; snprintf(s, sizeof s, "%.3f", start_sec); M.set_option_string(g_mpv, "start", s); }
     set_headers(headers);
     if (M.initialize(g_mpv) < 0) { destroy(); g_error = 1; snprintf(g_err, sizeof g_err, "Could not start the video engine"); g_active = 1; return; }
     {
         mpv_opengl_init_params gl = { gl_proc, NULL };
-        int adv = 1;
         mpv_render_param params[] = {
             { MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_OPENGL },
             { MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl },
-            { MPV_RENDER_PARAM_ADVANCED_CONTROL, &adv },
             { MPV_RENDER_PARAM_INVALID, NULL } };
         if (M.render_context_create(&g_rc, g_mpv, params) < 0) {
             destroy(); g_error = 1; snprintf(g_err, sizeof g_err, "Video output could not start"); g_active = 1; return;
