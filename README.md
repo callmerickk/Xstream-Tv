@@ -2,7 +2,8 @@
 
 The Xstream TV app written in C, for TV, tablet and Windows from one code base.
 
-- **Windows**: download `Xstream-TV-windows.zip` from the latest release, unzip, run `xstream.exe`.
+- **Windows**: from the latest release download `Xstream-TV-windows-x64.zip` (Intel / AMD) or
+  `Xstream-TV-windows-arm64.zip` (Snapdragon / ARM, native), unzip, run `xstream.exe`.
 - **Controls**: arrow keys move, Enter selects, Esc goes back, Space plays/pauses, F11 full screen.
 - **Addons**: catalogs come from Cinemeta. Add stream addon links, one per line, to `addons.txt`
   in the app's data folder (Windows: `%APPDATA%\xe\xe\addons.txt`).
