@@ -1,0 +1,224 @@
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.9/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+
+> Configure project :xehost
+Checking the license for package NDK (Side by side) 26.1.10909125 in /usr/local/lib/android/sdk/licenses
+License for package NDK (Side by side) 26.1.10909125 accepted.
+Preparing "Install NDK (Side by side) 26.1.10909125 v.26.1.10909125".
+"Install NDK (Side by side) 26.1.10909125 v.26.1.10909125" ready.
+Installing NDK (Side by side) 26.1.10909125 in /usr/local/lib/android/sdk/ndk/26.1.10909125
+"Install NDK (Side by side) 26.1.10909125 v.26.1.10909125" complete.
+"Install NDK (Side by side) 26.1.10909125 v.26.1.10909125" finished.
+WARNING: We recommend using a newer Android Gradle plugin to use compileSdk = 35
+
+This Android Gradle plugin (8.5.2) was tested up to compileSdk = 34.
+
+You are strongly encouraged to update your project to use a newer
+Android Gradle plugin that has been tested with compileSdk = 35.
+
+If you are already using the latest version of the Android Gradle plugin,
+you may need to wait until a newer version with support for compileSdk = 35 is available.
+
+For more information refer to the compatibility table:
+https://d.android.com/r/tools/api-level-support
+
+To suppress this warning, add/update
+    android.suppressUnsupportedCompileSdk=35
+to this project's gradle.properties.
+
+> Task :app:buildKotlinToolingMetadata
+> Task :app:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preReleaseBuild UP-TO-DATE
+> Task :xehost:preBuild UP-TO-DATE
+> Task :xehost:preReleaseBuild UP-TO-DATE
+> Task :app:generateReleaseResValues
+> Task :xehost:generateReleaseResValues
+> Task :xehost:writeReleaseAarMetadata
+> Task :xehost:generateReleaseResources
+> Task :app:checkReleaseAarMetadata
+> Task :xehost:packageReleaseResources
+> Task :app:mapReleaseSourceSetPaths
+> Task :app:generateReleaseResources
+> Task :app:packageReleaseResources
+> Task :app:createReleaseCompatibleScreenManifests
+> Task :app:extractDeepLinksRelease
+> Task :xehost:extractDeepLinksRelease
+> Task :xehost:compileReleaseLibraryResources
+> Task :app:parseReleaseLocalResources
+> Task :xehost:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :xehost:parseReleaseLocalResources
+> Task :xehost:javaPreCompileRelease
+> Task :app:javaPreCompileRelease
+> Task :xehost:processReleaseManifest
+> Task :xehost:generateReleaseRFile
+> Task :app:extractProguardFiles
+> Task :app:mergeReleaseResources
+> Task :app:processReleaseMainManifest
+> Task :app:processReleaseManifest
+> Task :app:processReleaseManifestForPackage
+> Task :xehost:extractProguardFiles
+> Task :xehost:prepareLintJarForPublish
+> Task :app:processReleaseResources
+
+> Task :xehost:configureCMakeRelWithDebInfo[arm64-v8a]
+Checking the license for package CMake 3.22.1 in /usr/local/lib/android/sdk/licenses
+License for package CMake 3.22.1 accepted.
+Preparing "Install CMake 3.22.1 v.3.22.1".
+"Install CMake 3.22.1 v.3.22.1" ready.
+Installing CMake 3.22.1 in /usr/local/lib/android/sdk/cmake/3.22.1
+"Install CMake 3.22.1 v.3.22.1" complete.
+"Install CMake 3.22.1 v.3.22.1" finished.
+
+> Task :xehost:compileReleaseKotlin
+> Task :xehost:compileReleaseJavaWithJavac NO-SOURCE
+> Task :xehost:bundleLibRuntimeToJarRelease
+> Task :xehost:bundleLibCompileToJarRelease
+> Task :xehost:processReleaseJavaRes
+> Task :xehost:createFullJarRelease
+> Task :xehost:generateReleaseLintModel
+> Task :app:compileReleaseKotlin
+
+> Task :xehost:buildCMakeRelWithDebInfo[arm64-v8a]
+C/C++: ninja: Entering directory `/home/runner/work/Xstream-Tv/Xstream-Tv/android/xehost/.cxx/RelWithDebInfo/105t4u4c/arm64-v8a'
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:38:14: warning: unused function 'app_strdup' [-Wunused-function]
+C/C++: static char *app_strdup(const char *s)
+C/C++:              ^
+C/C++: 1 warning generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:99:27: warning: unused variable 'vao' [-Wunused-variable]
+C/C++: static GLuint program,vbo,vao; static GLint u_view,u_tex,u_use_tex,u_clip;
+C/C++:                           ^
+C/C++: 1 warning generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:43:12: warning: unused function 'sbutton' [-Wunused-function]
+C/C++: static int sbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_focusable(id,r),a=xe_ui_activated(id);sbox(r,sd(8),primary?S_RED:(XeColor){0.15f,0.15f,0.18f,1});if(f)xe_r_border(r,sd(8),sd(2),S_WHITE);xe_label_box(label,r.x+sd(8),r.y+sd(9),sd(13),600,r.w-sd(16),1,1,S_WHITE);return a;}
+C/C++:            ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:44:13: warning: unused function 'srequest' [-Wunused-function]
+C/C++: static void srequest(void){if(!S.query_len)return;S.search_pending=1;S.result_ready=0;}
+C/C++:             ^
+C/C++: 2 warnings generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:66:6: warning: misleading indentation; statement is not part of the previous 'for' [-Wmisleading-indentation]
+C/C++:     }return NULL;
+C/C++:      ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:62:38: note: previous statement is here
+C/C++:     int i; double now=now_seconds(); for(i=0;i<CACHE_MAX;i++)if(g_cache[i].url&&strcmp(g_cache[i].url,url)==0){
+C/C++:                                      ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:100:13: warning: unused function 'meta_overlay' [-Wunused-function]
+C/C++: static void meta_overlay(XeMeta *dst,const XeMeta *src) {
+C/C++:             ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:222:13: warning: unused function 'stream_response' [-Wunused-function]
+C/C++: static void stream_response(const XeHttpResponse *r,void *u) { StreamCtx *c=(StreamCtx*)u;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){void *arr=xe_json_obj_get(root,"streams");s=streams_parse(arr,c->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }
+C/C++:             ^
+C/C++: 3 warnings generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:88:13: warning: variable 'desc_y' set but not used [-Wunused-but-set-variable]
+C/C++:  float y=12,desc_y,play_y,season_y,episodes_y;int i;
+C/C++:             ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:47:12: warning: unused function 'deq' [-Wunused-function]
+C/C++: static int deq(const char *a,const char *b){return a&&b&&strcmp(a,b)==0;}
+C/C++:            ^
+C/C++: 2 warnings generated.
+
+> Task :app:compileReleaseJavaWithJavac NO-SOURCE
+> Task :app:generateReleaseLintVitalReportModel
+> Task :xehost:configureCMakeRelWithDebInfo[armeabi-v7a]
+
+> Task :xehost:buildCMakeRelWithDebInfo[armeabi-v7a]
+C/C++: ninja: Entering directory `/home/runner/work/Xstream-Tv/Xstream-Tv/android/xehost/.cxx/RelWithDebInfo/105t4u4c/armeabi-v7a'
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:38:14: warning: unused function 'app_strdup' [-Wunused-function]
+C/C++: static char *app_strdup(const char *s)
+C/C++:              ^
+C/C++: 1 warning generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:88:13: warning: variable 'desc_y' set but not used [-Wunused-but-set-variable]
+C/C++:  float y=12,desc_y,play_y,season_y,episodes_y;int i;
+C/C++:             ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:47:12: warning: unused function 'deq' [-Wunused-function]
+C/C++: static int deq(const char *a,const char *b){return a&&b&&strcmp(a,b)==0;}
+C/C++:            ^
+C/C++: 2 warnings generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:99:27: warning: unused variable 'vao' [-Wunused-variable]
+C/C++: static GLuint program,vbo,vao; static GLint u_view,u_tex,u_use_tex,u_clip;
+C/C++:                           ^
+C/C++: 1 warning generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:43:12: warning: unused function 'sbutton' [-Wunused-function]
+C/C++: static int sbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_focusable(id,r),a=xe_ui_activated(id);sbox(r,sd(8),primary?S_RED:(XeColor){0.15f,0.15f,0.18f,1});if(f)xe_r_border(r,sd(8),sd(2),S_WHITE);xe_label_box(label,r.x+sd(8),r.y+sd(9),sd(13),600,r.w-sd(16),1,1,S_WHITE);return a;}
+C/C++:            ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:44:13: warning: unused function 'srequest' [-Wunused-function]
+C/C++: static void srequest(void){if(!S.query_len)return;S.search_pending=1;S.result_ready=0;}
+C/C++:             ^
+C/C++: 2 warnings generated.
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:66:6: warning: misleading indentation; statement is not part of the previous 'for' [-Wmisleading-indentation]
+C/C++:     }return NULL;
+C/C++:      ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:62:38: note: previous statement is here
+C/C++:     int i; double now=now_seconds(); for(i=0;i<CACHE_MAX;i++)if(g_cache[i].url&&strcmp(g_cache[i].url,url)==0){
+C/C++:                                      ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:100:13: warning: unused function 'meta_overlay' [-Wunused-function]
+C/C++: static void meta_overlay(XeMeta *dst,const XeMeta *src) {
+C/C++:             ^
+C/C++: /home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:222:13: warning: unused function 'stream_response' [-Wunused-function]
+C/C++: static void stream_response(const XeHttpResponse *r,void *u) { StreamCtx *c=(StreamCtx*)u;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){void *arr=xe_json_obj_get(root,"streams");s=streams_parse(arr,c->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }
+C/C++:             ^
+C/C++: 3 warnings generated.
+
+> Task :xehost:mergeReleaseJniLibFolders
+> Task :xehost:extractDeepLinksForAarRelease
+> Task :xehost:mergeReleaseNativeLibs
+> Task :xehost:extractReleaseAnnotations
+> Task :xehost:mergeReleaseGeneratedProguardFiles
+> Task :xehost:mergeReleaseConsumerProguardFiles
+> Task :xehost:mergeReleaseShaders
+> Task :xehost:compileReleaseShaders NO-SOURCE
+> Task :xehost:generateReleaseAssets UP-TO-DATE
+> Task :xehost:packageReleaseAssets
+> Task :xehost:stripReleaseDebugSymbols
+> Task :xehost:prepareReleaseArtProfile
+> Task :xehost:copyReleaseJniLibsProjectAndLocalJars
+> Task :xehost:writeReleaseLintModelMetadata
+> Task :xehost:generateReleaseLintVitalModel
+> Task :xehost:mergeReleaseJavaResource
+> Task :app:mergeReleaseJniLibFolders
+> Task :xehost:syncReleaseLibJars
+> Task :xehost:bundleReleaseLocalLintAar
+> Task :xehost:copyReleaseJniLibsProjectOnly
+> Task :app:checkReleaseDuplicateClasses
+> Task :app:mergeReleaseNativeLibs
+> Task :app:dexBuilderRelease
+> Task :app:desugarReleaseFileDependencies
+> Task :app:mergeReleaseStartupProfile
+> Task :app:stripReleaseDebugSymbols
+> Task :app:mergeReleaseArtProfile
+> Task :app:extractReleaseNativeSymbolTables
+> Task :app:mergeReleaseGlobalSynthetics
+> Task :app:mergeReleaseShaders
+> Task :app:compileReleaseShaders NO-SOURCE
+> Task :app:generateReleaseAssets UP-TO-DATE
+> Task :app:mergeReleaseAssets
+> Task :app:mergeReleaseNativeDebugMetadata
+> Task :app:extractReleaseVersionControlInfo
+> Task :app:processReleaseJavaRes
+> Task :app:compressReleaseAssets
+> Task :app:mergeReleaseJavaResource
+> Task :app:collectReleaseDependencies
+> Task :app:sdkReleaseDependencyData
+> Task :app:optimizeReleaseResources
+> Task :app:validateSigningRelease
+> Task :app:writeReleaseAppMetadata
+> Task :app:writeReleaseSigningConfigVersions
+> Task :xehost:bundleReleaseAar
+> Task :xehost:mapReleaseSourceSetPaths
+> Task :xehost:mergeReleaseResources
+> Task :xehost:verifyReleaseResources
+> Task :xehost:assembleRelease
+> Task :app:mergeExtDexRelease
+> Task :app:mergeDexRelease
+> Task :app:compileReleaseArtProfile
+> Task :app:packageRelease
+> Task :app:createReleaseApkListingFileRedirect
+> Task :xehost:lintVitalAnalyzeRelease
+> Task :app:lintVitalAnalyzeRelease
+> Task :app:lintVitalReportRelease
+> Task :app:lintVitalRelease
+> Task :app:assembleRelease
+gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/__run-1792536887010.json
+
+BUILD SUCCESSFUL in 1m 56s
+93 actionable tasks: 93 executed
