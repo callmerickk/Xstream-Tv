@@ -252,6 +252,7 @@ static void route_events(void)
             }
             continue;
         }
+        if (e.type == XE_EV_KEY_DOWN && e.key == XE_KEY_SEARCH && g_screen == SCR_HOME) { g_screen = SCR_SEARCH; xe_ui_set_focus(0); continue; }
         if (n < 128) keep[n++] = e;
     }
     for (i = 0; i < n; i++) xe_platform_push_event(&keep[i]);

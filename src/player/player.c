@@ -223,7 +223,7 @@ int xe_player_tracks(int kind, char names[][64], int max)
             }
             if (!type || strcmp(type, kinds[kind])) continue;
             snprintf(names[n++], 64, "%s%s%s%s", title ? title : (lang ? lang : "Track"),
-                     title && lang ? " · " : "", title && lang ? lang : "", sel ? "  \xE2\x9C\x93" : "");
+                     title && lang ? " · " : "", title && lang ? lang : "", sel ? "  \xE2\x80\xA2" : "");
         }
     M.free_node_contents(&list);
     return n;

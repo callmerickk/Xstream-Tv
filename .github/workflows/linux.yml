@@ -30,7 +30,7 @@ jobs:
           SCRIPT: ${{ github.event.inputs.script }}
         run: |
           mkdir -p out/shots
-          S="${SCRIPT:-14:SHOT=out/shots/1-home.png;15:DOWN;16:DOWN;17:RIGHT;18:SHOT=out/shots/2-home-rows.png;19:OK;25:SHOT=out/shots/3-detail.png;26:BACK;27:UP;27.5:UP;28:UP;28.5:RIGHT;29:RIGHT;29.5:RIGHT;30:RIGHT;30.5:RIGHT;31:RIGHT;31.5:SHOT=out/shots/4-topbar.png;32:OK;34:TEXT=batman;35:SHOT=out/shots/5-search-typed.png;36:SEARCH;37:QUIT}"
+          S="${SCRIPT:-14:SHOT=out/shots/1-home.png;15:DOWN;16:DOWN;17:RIGHT;18:SHOT=out/shots/2-home-rows.png;19:DOWN;20:DOWN;22:SHOT=out/shots/3-home-scrolled.png;23:OK;29:SHOT=out/shots/4-detail.png;30:BACK;31:SEARCH;32:TEXT=batman;38:SHOT=out/shots/5-search.png;39:QUIT}"
           cd build && timeout 150 xvfb-run -a -s "-screen 0 1280x720x24" gdb -q -batch -ex run -ex bt -ex "info locals" --args ./xstream --script "$(echo "$S" | sed 's#out/#../out/#g')" > ../out/run.log 2>&1 || echo "exit $?" >> ../out/run.log
           tail -40 ../out/run.log
       - name: Save logs and screenshots to the ci-linux branch

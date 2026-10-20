@@ -76,7 +76,7 @@ static void tracks_menu(XeRect area, float k)
             int f = xe_ui_focusable(O.track_ids[c][i], r);
             if (r.y > area.h - 200 * k) break;
             xe_r_rect(r, 8 * k, f ? (XeColor){1, 1, 1, 0.14f} : (XeColor){0, 0, 0, 0});
-            xe_label_box(names[c][i], r.x + 14 * k, r.y + 11 * k, 17 * k, strstr(names[c][i], "\xE2\x9C\x93") ? 700 : 400, r.w - 28 * k, 1, 0, P_WHITE);
+            xe_label_box(names[c][i], r.x + 14 * k, r.y + 11 * k, 17 * k, strstr(names[c][i], "\xE2\x80\xA2") ? 700 : 400, r.w - 28 * k, 1, 0, P_WHITE);
             if (xe_ui_activated(O.track_ids[c][i])) xe_player_select(c, i);
         }
     }
@@ -157,7 +157,7 @@ void xe_player_frame(double dt, XeRect area)
         snprintf(times, sizeof times, "%s / %s", a, b);
         xe_label(times, 64 * k, by + 22 * k, 17 * k, P_WHITE);
         if (dur > 0) { char t2[64]; snprintf(t2, sizeof t2, "-%s", left); xe_label_box(t2, area.w - 364 * k, by + 22 * k, 17 * k, 400, 300 * k, 1, 2, P_MUTED); }
-        labels[0] = "\xE2\x86\xBA 10s"; labels[1] = xe_player_paused() ? "Play" : "Pause"; labels[2] = "10s \xE2\x86\xBB"; labels[3] = "Audio & Subtitles";
+        labels[0] = "-10s"; labels[1] = xe_player_paused() ? "Play" : "Pause"; labels[2] = "+10s"; labels[3] = "Audio & Subtitles";
         bw = 150 * k;
         for (i = 0; i < 4; i++) {
             XeRect r = { 64 * k + i * (bw + 16 * k), by + 72 * k, i == 3 ? 240 * k : bw, 58 * k };

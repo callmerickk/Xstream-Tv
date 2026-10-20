@@ -58,18 +58,21 @@ void xe_detail_frame(double dt,XeRect area){XeEvent ev[D_MAX_EVENTS];int n=0,i;f
  if(!D.initialized||!D.has_meta){dtxt("No title selected",dd(64),dd(70),dd(28),D_WHITE);xe_ui_end();xe_r_end();return;}
  if(D.backdrop){const XeTexture *t=xe_img_tex(D.backdrop);if(t)xe_r_image(t,(XeRect){0,0,w,h},0,xe_img_fade(D.backdrop),0);}
  /* Layered left/bottom scrims approximate the cinema-gradient without a new shader API. */
- for(i=0;i<8;i++){float a=0.76f*(1.0f-(float)i/9.0f);dbox((XeRect){w*(float)i/8.0f,0,w/8.0f+1,h},0,(XeColor){0.02f,0.02f,0.03f,a});}
- dbox((XeRect){0,h*0.68f,w,h*0.32f},0,(XeColor){0.02f,0.02f,0.03f,0.66f});
+ xe_r_rect_hgrad((XeRect){0,0,w*0.75f,h},0,(XeColor){0.02f,0.02f,0.03f,0.92f},(XeColor){0.02f,0.02f,0.03f,0.0f});
+ xe_r_rect_vgrad((XeRect){0,h*0.45f,w,h*0.55f},0,(XeColor){0.02f,0.02f,0.03f,0.0f},(XeColor){0.02f,0.02f,0.03f,0.95f});
  /* Title and facts */
  if(D.logo){const XeTexture *t=xe_img_tex(D.logo);if(t)xe_r_image(t,(XeRect){dd(64),dd(46),dd(380),dd(150)},0,xe_img_fade(D.logo),0);}else dtxt(D.meta.name?D.meta.name:"Untitled",dd(64),dd(88),dd(36),D_WHITE);
  {char facts[512];int used=0;facts[0]=0;if(D.meta.release)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"%s",D.meta.release);if(D.meta.runtime&&used<(int)sizeof(facts)-8)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  %s",D.meta.runtime);if(D.meta.imdb_rating&&used<(int)sizeof(facts)-8)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  IMDb %s",D.meta.imdb_rating);for(i=0;i<D.meta.n_genres&&used<(int)sizeof(facts)-48;i++)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  %s",D.meta.genres[i]);dtxt(facts,dd(66),dd(218),dd(15),D_MUTED);}
- if(D.meta.description){char desc[1024];snprintf(desc,sizeof(desc),"%s",D.meta.description);if(!D.expanded&&strlen(desc)>205){desc[200]=0;strcat(desc,"…");}dtxt(desc,dd(66),dd(252),dd(16),D_WHITE);if(strlen(D.meta.description)>205){if(dbutton(D.expand_id,(XeRect){dd(64),dd(322),dd(150),dd(38)},D.expanded?"Show less":"More details",0))D.expanded=!D.expanded;}}
- if(dbutton(D.play_id,(XeRect){dd(64),dd(382),dd(230),dd(62)},"▶  Play / Resume",1))dmake_play(D.meta.id,D.meta.type);
- if(dbutton(D.trailer_id,(XeRect){dd(310),dd(382),dd(150),dd(62)},"Trailer",0)){}if(dbutton(D.list_id,(XeRect){dd(474),dd(382),dd(100),dd(62)},D.list_added?"✓ Listed":"＋ List",0))D.list_added=!D.list_added;
+ if(D.meta.description){char desc[1024];snprintf(desc,sizeof(desc),"%s",D.meta.description);if(!D.expanded&&strlen(desc)>205){desc[200]=0;strcat(desc,"…");}(void)desc;xe_label_box(D.meta.description,dd(66),dd(252),dd(16),400,dd(620),D.expanded?10:3,0,D_WHITE);if(strlen(D.meta.description)>205){if(dbutton(D.expand_id,(XeRect){dd(64),dd(322),dd(150),dd(38)},D.expanded?"Show less":"More details",0))D.expanded=!D.expanded;}}
+ if(dbutton(D.play_id,(XeRect){dd(64),dd(382),dd(230),dd(62)},"Play",1))dmake_play(D.meta.id,D.meta.type);
+ if(dbutton(D.trailer_id,(XeRect){dd(310),dd(382),dd(150),dd(62)},"Trailer",0)){}if(dbutton(D.list_id,(XeRect){dd(474),dd(382),dd(150),dd(62)},D.list_added?"In My List":"+ My List",0))D.list_added=!D.list_added;
  /* Tabs and series episodes follow the reference detail layout. */
+ if(D.meta.type&&strcmp(D.meta.type,"movie")!=0){
  {const char *tabs[]={"Episodes","More Like This","Trailers & More"};float tx=dd(64);for(i=0;i<3;i++){XeRect r={tx,dd(492),dd(i==1?190:150),dd(44)};int f=xe_ui_focusable(D.tab_ids[i],r);if(f||D.active_tab==i)xe_r_border(r,dd(8),dd(2),D.active_tab==i?D_RED:D_WHITE);dtxt(tabs[i],r.x+dd(8),r.y+dd(14),dd(15),D_WHITE);if(xe_ui_activated(D.tab_ids[i]))D.active_tab=i;tx+=r.w+dd(18);}}
  if(D.meta.type&&strcmp(D.meta.type,"movie")!=0){dtxt("Season",dd(64),dd(560),dd(16),D_WHITE);for(i=0;i<(g_max_season>0?(g_max_season<14?g_max_season:14):1);i++){char s[32];XeRect r={dd(140+i*72),dd(548),dd(60),dd(40)};snprintf(s,sizeof(s),"S%d",i+1);int f=xe_ui_focusable(D.season_ids[i],r);dbox(r,dd(8),D.season==i+1?D_RED:(XeColor){0.16f,0.16f,0.18f,1});if(f)xe_r_border(r,dd(8),dd(2),D_WHITE);dtxt(s,r.x+dd(18),r.y+dd(12),dd(14),D_WHITE);if(xe_ui_activated(D.season_ids[i])){D.season=i+1;d_refill();}}}
- d_draw_episodes(dd(64),dd(610),w-dd(128),dd(235));xe_ui_end();xe_r_end();}
+ d_draw_episodes(dd(64),dd(610),w-dd(128),dd(235));
+ }
+ xe_ui_end();xe_r_end();}
 int xe_detail_play(char *out_type,char *out_id,size_t cap){if(!D.play_pending)return 0;D.play_pending=0;if(out_type)snprintf(out_type,cap,"%s",D.play_type);if(out_id&&cap)snprintf(out_id,cap,"%s",D.play_value);return 1;}
 
 /* ---- episodes from the data layer (xe_data_meta). Ids are Stremio video ids ("tt..:1:2"). */

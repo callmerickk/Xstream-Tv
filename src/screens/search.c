@@ -43,12 +43,15 @@ static int sbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_f
 static void srequest(void){if(!S.query_len)return;S.search_pending=1;S.result_ready=0;}
 static void sresults_cb(XeMeta *items,int n,void *u){int i;(void)u;for(i=0;i<S.result_count;i++)smeta_free(&S.results[i].m);S.result_count=0;if(n>S_MAX_RESULTS)n=S_MAX_RESULTS;for(i=0;i<n;i++){if(smeta_copy(&S.results[i].m,&items[i])){char full[2048];S.results[i].image=NULL;if(items[i].poster){if(strstr(items[i].poster,"http://")==items[i].poster||strstr(items[i].poster,"https://")==items[i].poster)snprintf(full,sizeof(full),"%s",items[i].poster);else snprintf(full,sizeof(full),"https://image.tmdb.org/t/p/w342%s",items[i].poster);S.results[i].image=xe_img_get(full,342,513);}S.result_ids[i]=xe_id_mix(xe_id("search-result"),i);S.result_count++;}}S.search_pending=0;S.result_ready=1;}
 static void srun_search(void){char q[S_QUERY_CAP];if(!S.query_len)return;snprintf(q,sizeof(q),"%s",S.query);if(S.recent_count<S_MAX_RECENT){int i;for(i=S.recent_count;i>0;i--)memcpy(S.recent[i],S.recent[i-1],S_QUERY_CAP);snprintf(S.recent[0],S_QUERY_CAP,"%s",q);S.recent_count++;}else{int i;for(i=S_MAX_RECENT-1;i>0;i--)memcpy(S.recent[i],S.recent[i-1],S_QUERY_CAP);snprintf(S.recent[0],S_QUERY_CAP,"%s",q);}xe_data_search(q,sresults_cb,NULL);S.search_pending=1;}
-static void sadd_char(char c){if(S.query_len+1<S_QUERY_CAP){S.query[S.query_len++]=c;S.query[S.query_len]=0;}}
-static void sdelete(void){if(S.query_len){S.query[--S.query_len]=0;}}
+static double s_dirty_at;
+/* typing searches by itself once the user pauses, like StreamX */
+static void sadd_char(char c){if(S.query_len+1<S_QUERY_CAP){S.query[S.query_len++]=c;S.query[S.query_len]=0;s_dirty_at=xe_time_now();}}
+static void sdelete(void){if(S.query_len){S.query[--S.query_len]=0;s_dirty_at=xe_time_now();}}
 static const char *KEYS[]={"1","2","3","4","5","6","7","8","9","0","q","w","e","r","t","y","u","i","o","p","a","s","d","f","g","h","j","k","l","z","x","c","v","b","n","m","Space","Delete","Clear","Search"};
 void xe_search_frame(double dt,XeRect area){XeEvent ev[S_MAX_EVENTS];int n=0,i;float w=area.w,h=area.h;S.density=1.0f;if(!S.initialized){for(i=0;i<40;i++)S.key_ids[i]=xe_id_mix(xe_id("search-key"),i);for(i=0;i<S_MAX_RECENT;i++)S.recent_ids[i]=xe_id_mix(xe_id("search-recent"),i);S.search_id=xe_id("search-submit");S.clear_id=xe_id("search-clear");S.initialized=1;xe_ui_set_focus(S.key_ids[0]);}while(n<S_MAX_EVENTS&&xe_platform_poll(&ev[n]))n++;xe_ui_begin(dt,ev,n);xe_img_pump();xe_data_pump();
  /* Windows physical keyboard: text input goes directly into the query. Event field names follow P1 platform.h. */
  for(i=0;i<n;i++){if(ev[i].type==XE_EV_KEY_DOWN&&ev[i].key==XE_KEY_DELETE)sdelete();else if(ev[i].type==XE_EV_TEXT&&ev[i].codepoint>=32&&ev[i].codepoint<127)sadd_char((char)ev[i].codepoint);}
+ if(s_dirty_at>0&&xe_time_now()-s_dirty_at>0.6){s_dirty_at=0;if(S.query_len>=2){xe_data_search(S.query,sresults_cb,NULL);S.search_pending=1;}}
  xe_r_begin((int)w,(int)h);sbox((XeRect){0,0,w,h},0,S_BG);stxt("Search",sd(54),sd(48),sd(30),S_WHITE);
  sbox((XeRect){sd(54),sd(70),w-sd(108),sd(54)},sd(8),(XeColor){0.12f,0.12f,0.15f,1});stxt(S.query,sd(70),sd(88),sd(20),S_WHITE);if(!S.query_len)stxt("Search movies and series…",sd(70),sd(88),sd(18),S_MUTED);
  /* Remote keyboard grid: typing is local; only the Search key triggers a request. */

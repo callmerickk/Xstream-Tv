@@ -179,8 +179,8 @@ static void draw_backdrop(float w,float h) {
     draw_rect(0,0,w,h,0,HOME_BG);
     if(H.backdrop)draw_image(H.backdrop,0,0,w,h,0);
     /* Low-cost translucent panels simulate a left-to-right and bottom gradient using layered alpha. */
-    { int i; for(i=0;i<12;i++){float a=0.06f+(float)(11-i)*0.012f; draw_rect((float)i*w/12.0f,0,w/12.0f+1,h,0,(XeColor){0.025f,0.025f,0.035f,a});} }
-    { int i; for(i=0;i<9;i++){float a=0.045f+(float)i*0.045f;draw_rect(0,h-(float)(i+1)*h/9.0f,w,h/9.0f+1,0,(XeColor){0.025f,0.025f,0.035f,a});} }
+    xe_r_rect_hgrad((XeRect){0,0,dp(w),dp(h)},0,(XeColor){0.025f,0.025f,0.035f,0.88f},(XeColor){0.025f,0.025f,0.035f,0.35f});
+    xe_r_rect_vgrad((XeRect){0,dp(h*0.35f),dp(w),dp(h*0.65f)},0,(XeColor){0.025f,0.025f,0.035f,0.0f},(XeColor){0.025f,0.025f,0.035f,0.97f});
 }
 static void draw_deck(float w,float h) {
     float y=116, left=56, cardw=fminf(550.0f,w*0.43f), cardh=300, gap=24; int k;
@@ -193,19 +193,20 @@ static void draw_deck(float w,float h) {
     for(k=2;k>=0;k--) {
         float x=left+(float)k*(cardw*0.70f+gap), scale=k==0?1.0f:(k==1?0.86f:0.74f);
         float cw=cardw*scale,ch=cardh*scale, yy=y+(cardh-ch)*0.5f, dim=k==0?1.0f:(k==1?0.52f:0.30f);
-        XeMeta *m=NULL; if(H.n_rows>0&&H.rows[0].n>k)m=&H.rows[0].items[k];
+        XeMeta *m=NULL; if(k==0)m=hero; else if(H.n_rows>0&&H.rows[0].n>k)m=&H.rows[0].items[k];
         XeRect r={dp(x),dp(yy),dp(cw),dp(ch)}; int f=xe_ui_focusable(H.deck_ids[k],r);
         draw_rect(x,yy,cw,ch,12,(XeColor){.12f,.13f,.17f,dim});
-        if(m&&m->poster){XeImage *im=image_get_cached(m->poster,640,960);draw_image(im,x,yy,cw,ch,12);}
+        if(m&&(m->background||m->poster)){XeImage *im=image_get_cached(m->background?m->background:m->poster,780,440);draw_image(im,x,yy,cw,ch,12);}
+        if(k==0)xe_r_rect_vgrad((XeRect){dp(x),dp(yy+ch*0.35f),dp(cw),dp(ch*0.65f)},dp(12),(XeColor){0.02f,0.02f,0.03f,0.0f},(XeColor){0.02f,0.02f,0.03f,0.9f});
         draw_rect(x,yy,cw,ch,12,(XeColor){.02f,.02f,.03f,(1.0f-dim)*0.68f});
         if(k==0&&hero) {
             if(H.logo)draw_image(H.logo,x+24,yy+24,fminf(cw-48,330),76,0);
             else draw_text_fit(hero->name?hero->name:"Featured",x+24,yy+38,32,cw-48,HOME_WHITE);
-            char line[256];snprintf(line,sizeof(line),"%s  ·  %s  ·  ★ %s",meta_year(hero),meta_genre(hero),hero->imdb_rating?hero->imdb_rating:"—");
+            char line[256];snprintf(line,sizeof(line),"%s  ·  %s%s%s",meta_year(hero),meta_genre(hero),hero->imdb_rating&&*hero->imdb_rating?"  ·  IMDb ":"",hero->imdb_rating?hero->imdb_rating:"");
             draw_text_fit(line,x+24,yy+124,16,cw-48,HOME_MUTED);
             if(hero->description)draw_text_fit(hero->description,x+24,yy+158,15,cw-60,(XeColor){.84f,.84f,.87f,1});
-            { XeRect pr={dp(x+24),dp(yy+ch-62),dp(112),dp(42)};int pf=xe_ui_focusable(H.play_id,pr);draw_rect(x+24,yy+ch-62,112,42,6,HOME_WHITE);draw_text("▶  Play",x+43,yy+ch-51,17,(XeColor){.04f,.04f,.05f,1});if(pf)draw_border(x+21,yy+ch-65,118,48,7,2,HOME_ACCENT);if(xe_ui_activated(H.play_id)){if(H.opened_valid)hfree_meta(&H.opened);H.opened_valid=hcopy_meta(&H.opened,hero);} }
-            { XeRect lr={dp(x+148),dp(yy+ch-62),dp(112),dp(42)};int lf=xe_ui_focusable(H.list_id,lr);draw_rect(x+148,yy+ch-62,112,42,6,(XeColor){.18f,.19f,.23f,.96f});draw_text("＋  List",x+168,yy+ch-51,17,HOME_WHITE);if(lf)draw_border(x+145,yy+ch-65,118,48,7,2,HOME_ACCENT); }
+            { XeRect pr={dp(x+24),dp(yy+ch-62),dp(112),dp(42)};int pf=xe_ui_focusable(H.play_id,pr);draw_rect(x+24,yy+ch-62,112,42,6,HOME_WHITE);draw_text("Play",x+50,yy+ch-51,17,(XeColor){.04f,.04f,.05f,1});if(pf)draw_border(x+21,yy+ch-65,118,48,7,2,HOME_ACCENT);if(xe_ui_activated(H.play_id)){if(H.opened_valid)hfree_meta(&H.opened);H.opened_valid=hcopy_meta(&H.opened,hero);} }
+            { XeRect lr={dp(x+148),dp(yy+ch-62),dp(112),dp(42)};int lf=xe_ui_focusable(H.list_id,lr);draw_rect(x+148,yy+ch-62,112,42,6,(XeColor){.18f,.19f,.23f,.96f});draw_text("+ List",x+172,yy+ch-51,17,HOME_WHITE);if(lf)draw_border(x+145,yy+ch-65,118,48,7,2,HOME_ACCENT); }
         }
         if(f||xe_ui_focus_anim(H.deck_ids[k])>0.02f)draw_border(x-2,yy-2,cw+4,ch+4,12,2,HOME_ACCENT);
     }

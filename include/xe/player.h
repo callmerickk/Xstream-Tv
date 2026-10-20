@@ -17,7 +17,7 @@ int  xe_player_paused(void);
 double xe_player_pos(void);
 double xe_player_dur(void);
 int  xe_player_buffering(void);
-/* kind: 0 audio, 1 subtitles, 2 video. Names end with " ✓" when selected. */
+/* kind: 0 audio, 1 subtitles, 2 video. Names end with "  •" when selected. */
 int  xe_player_tracks(int kind, char names[][64], int max);
 void xe_player_select(int kind, int index);
 /* Backend: draws the current video frame into the window (desktop). */
