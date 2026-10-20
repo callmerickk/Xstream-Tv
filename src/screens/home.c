@@ -3,6 +3,7 @@
 #include "xe/text.h"
 #include "xe/images.h"
 #include "xe/ui.h"
+#include "xe/splash.h"
 #include "xe/anim.h"
 #include "xe/data.h"
 #include <math.h>
