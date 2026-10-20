@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdint.h>
 #ifdef _WIN32
+#define strtok_r strtok_s
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #define LIBMPV_NAME "libmpv-2.dll"
@@ -138,6 +139,14 @@ void xe_player_open(const char *url, const char *const *headers, double start_se
     M.set_option_string(g_mpv, "osd-level", "0");
     if (getenv("XE_MPV_LOG")) M.set_option_string(g_mpv, "log-file", getenv("XE_MPV_LOG"));
     if (getenv("XE_MPV_AO")) M.set_option_string(g_mpv, "ao", getenv("XE_MPV_AO"));
+    if (getenv("XE_MPV_OPTS")) {      /* testing: "name=value;name=value" */
+        char buf[512], *s, *save = NULL;
+        snprintf(buf, sizeof buf, "%s", getenv("XE_MPV_OPTS"));
+        for (s = strtok_r(buf, ";", &save); s; s = strtok_r(NULL, ";", &save)) {
+            char *eq = strchr(s, '=');
+            if (eq) { *eq = 0; M.set_option_string(g_mpv, s, eq + 1); }
+        }
+    }
     M.set_option_string(g_mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Xstream");
     if (start_sec > 1) { char s[48]; snprintf(s, sizeof s, "%.3f", start_sec); M.set_option_string(g_mpv, "start", s); }
     set_headers(headers);
