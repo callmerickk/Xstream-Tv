@@ -1,0 +1,207 @@
+-- The C compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Found Freetype: /usr/lib/x86_64-linux-gnu/libfreetype.so (found version "2.13.2")
+-- Found CURL: /usr/lib/x86_64-linux-gnu/libcurl.so (found version "8.5.0")
+-- Found OpenGL: /usr/lib/x86_64-linux-gnu/libGL.so
+-- Configuring done (1.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/runner/work/Xstream-Tv/Xstream-Tv/build
+[  4%] Building C object CMakeFiles/xe.dir/src/app/app.c.o
+[  9%] Building C object CMakeFiles/xe.dir/src/data/data.c.o
+[ 14%] Building C object CMakeFiles/xe.dir/src/images/images.c.o
+[ 19%] Building C object CMakeFiles/xe.dir/src/jobs/jobs.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘free_meta_fields’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:41:5: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   41 |     for(i=0;i<m->n_genres;i++)free(m->genres[i]); free(m->genres); memset(m,0,sizeof(*m));
+      |     ^~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:41:51: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   41 |     for(i=0;i<m->n_genres;i++)free(m->genres[i]); free(m->genres); memset(m,0,sizeof(*m));
+      |                                                   ^~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘join_url’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:52:5: warning: this ‘while’ clause does not guard... [-Wmisleading-indentation]
+   52 |     while(a>0&&base[a-1]=='/')a--; while(*path=='/')path++,b--;
+      |     ^~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:52:36: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘while’
+   52 |     while(a>0&&base[a-1]=='/')a--; while(*path=='/')path++,b--;
+      |                                    ^~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘url_encode’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:57:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   57 |     if(!s)return dup_s(""); for(i=0;s[i];i++) n+=(isalnum((unsigned char)s[i])||strchr("-_.~",s[i]))?1:3;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:57:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   57 |     if(!s)return dup_s(""); for(i=0;s[i];i++) n+=(isalnum((unsigned char)s[i])||strchr("-_.~",s[i]))?1:3;
+      |                             ^~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘cache_put’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:70:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   70 |     if(!url||!body||len>8*1024*1024)return;u=dup_s(url);b=dup_n(body,len);if(!u||!b){free(u);free(b);return;}
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:70:44: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   70 |     if(!url||!body||len>8*1024*1024)return;u=dup_s(url);b=dup_n(body,len);if(!u||!b){free(u);free(b);return;}
+      |                                            ^
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘stream_headers’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:115:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  115 |     if(!req)return;v=(char**)calloc(16,sizeof(char*));if(!v)return;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:115:20: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  115 |     if(!req)return;v=(char**)calloc(16,sizeof(char*));if(!v)return;
+      |                    ^
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: In function ‘catalog_response’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:156:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  156 |             if(p)h->shelves=p;if(o)h->order=o;
+      |             ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:156:31: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  156 |             if(p)h->shelves=p;if(o)h->order=o;
+      |                               ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:38:14: warning: ‘app_strdup’ defined but not used [-Wunused-function]
+   38 | static char *app_strdup(const char *s)
+      |              ^~~~~~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c: At top level:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:222:13: warning: ‘stream_response’ defined but not used [-Wunused-function]
+  222 | static void stream_response(const XeHttpResponse *r,void *u) { StreamCtx *c=(StreamCtx*)u;XeStream *s=NULL;int n=0;void *root;if(is_http_ok(r)&&(root=xe_json_parse(r->body,r->len))!=NULL){void *arr=xe_json_obj_get(root,"streams");s=streams_parse(arr,c->addon,&n);xe_json_delete(root);}if(c->cb)c->cb(s,n,0,c->user);else xe_data_free_streams(s,n);if(c->pending>0)c->pending--;if(c->pending==0){if(c->cb)c->cb(NULL,0,1,c->user);free(c->type);free(c->id);free(c->addon);free(c);} }
+      |             ^~~~~~~~~~~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/data/data.c:100:13: warning: ‘meta_overlay’ defined but not used [-Wunused-function]
+  100 | static void meta_overlay(XeMeta *dst,const XeMeta *src) {
+      |             ^~~~~~~~~~~~
+[ 23%] Building C object CMakeFiles/xe.dir/src/json/json.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c: In function ‘xe_app_frame’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:146:34: warning: ‘%s’ directive output may be truncated writing up to 511 bytes into a region of size 256 [-Wformat-truncation=]
+  146 |     snprintf(S.id, sizeof S.id, "%s", id);
+      |                                  ^~
+......
+  465 |             sources_open(strcmp(type, "movie") == 0 ? "movie" : "series", id, title);
+      |                                                                           ~~
+In file included from /usr/include/stdio.h:980,
+                 from /home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:17:
+In function ‘snprintf’,
+    inlined from ‘sources_open’ at /home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:146:5,
+    inlined from ‘xe_app_frame’ at /home/runner/work/Xstream-Tv/Xstream-Tv/src/app/app.c:465:13:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: ‘__builtin_snprintf’ output between 1 and 512 bytes into a destination of size 256
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+[ 28%] Building C object CMakeFiles/xe.dir/src/net/net.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c: In function ‘xe_img_get’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c:109:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  109 |     if(!url||!*url)return NULL;img_lock_init();if(want_w<1)want_w=342;if(want_h<1)want_h=512;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c:109:32: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  109 |     if(!url||!*url)return NULL;img_lock_init();if(want_w<1)want_w=342;if(want_h<1)want_h=512;
+      |                                ^~~~~~~~~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c: In function ‘xe_img_pump’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c:119:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  119 |     if(!g_mu_init)return;xe_jobs_pump();int uploaded=0;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c:119:26: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  119 |     if(!g_mu_init)return;xe_jobs_pump();int uploaded=0;
+      |                          ^~~~~~~~~~~~
+[ 33%] Building C object CMakeFiles/xe.dir/src/platform/platform_common.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/net/net.c: In function ‘xe_net_shutdown’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/net/net.c:604:17: warning: unused variable ‘dn’ [-Wunused-variable]
+  604 |     XeDone *d, *dn;
+      |                 ^~
+[ 38%] Building C object CMakeFiles/xe.dir/src/player/overlay.c.o
+[ 42%] Building C object CMakeFiles/xe.dir/src/player/player.c.o
+[ 47%] Building C object CMakeFiles/xe.dir/src/render/render_gl.c.o
+[ 52%] Building C object CMakeFiles/xe.dir/src/screens/detail.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c: In function ‘disk_recount_and_prune’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/images/images.c:70:331: warning: ‘__builtin_strncpy’ output may be truncated copying 1023 bytes from a string of length 1023 [-Wstringop-truncation]
+   70 |         DIR *d=opendir(dir);if(!d){g_disk_bytes=0;return;}struct dirent *e;while((e=readdir(d))){if(strncmp(e->d_name,"xe-images-",10)||!strstr(e->d_name,".bin"))continue;char p[1024];snprintf(p,sizeof(p),"%s/%s",dir,e->d_name);struct stat st;if(stat(p,&st))continue;total+=(size_t)st.st_size;if(!oldest[0]||st.st_atime<oldest_t){strncpy(oldest,p,sizeof(oldest)-1);oldest_t=st.st_atime;}}closedir(d);
+      |                                                                                                                                                                                                                                                                                                                                           ^
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c: In function ‘d_draw_phone’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c: In function ‘xe_r_shutdown’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:88:13: warning: variable ‘desc_y’ set but not used [-Wunused-but-set-variable]
+   88 |  float y=12,desc_y,play_y,season_y,episodes_y;int i;
+      |             ^~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:138:1: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  138 | if(vao)glDeleteVertexArrays(1,&vao);vao=0;
+      | ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:138:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  138 | if(vao)glDeleteVertexArrays(1,&vao);vao=0;
+      |                                     ^~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c: In function ‘xe_r_border_progress’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:175:2: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+  175 |  for(i=0;i<8;i++)total+=seg[i];left=progress*total;
+      |  ^~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:175:32: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+  175 |  for(i=0;i<8;i++)total+=seg[i];left=progress*total;
+      |                                ^~~~
+[ 57%] Building C object CMakeFiles/xe.dir/src/screens/home.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c: At top level:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/detail.c:47:12: warning: ‘deq’ defined but not used [-Wunused-function]
+   47 | static int deq(const char *a,const char *b){return a&&b&&strcmp(a,b)==0;}
+      |            ^~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c: At top level:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:104:20: warning: ‘fshader_es’ defined but not used [-Wunused-variable]
+  104 | static const char *fshader_es="#extension GL_OES_standard_derivatives : enable\nprecision mediump float; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; uniform sampler2D u_tex; uniform int u_use_tex; uniform vec4 u_clip; varying float v_radius; varying vec4 v_extra; float sdRound(vec2 p,vec2 b,float r){vec2 q=abs(p)-b+vec2(r);return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;} float shapeDist(){ if(v_extra.x>2.5){ return -1.0; } if(v_extra.x>1.5){ vec2 p=v_shape.xy; p.x=abs(p.x); vec2 sc=v_extra.zw; return ((sc.y*p.x>sc.x*p.y)?length(p-sc*v_shape.z):abs(length(p)-v_shape.z))-v_shape.w; } float d=sdRound(v_shape.xy, v_shape.zw, v_radius); if(v_extra.x>0.5) d=abs(d+v_extra.y*0.5)-v_extra.y*0.5; return d; } void main(){ float d=shapeDist(); float aa=max(fwidth(d),0.7); float cov=1.0-smoothstep(-aa,aa,d); if(v_extra.x>2.5) cov=clamp(1.0-length(v_shape.xy)/v_shape.z,0.0,1.0); vec4 c=v_col; if(u_use_tex==1){vec4 t=texture2D(u_tex,v_uv);c*=vec4(t.rgb*t.a,t.a);} c*=cov; gl_FragColor=c; }";
+      |                    ^~~~~~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/render/render_gl.c:103:20: warning: ‘vshader_es’ defined but not used [-Wunused-variable]
+  103 | static const char *vshader_es="attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_col; attribute vec4 a_shape; attribute float a_radius; attribute vec4 a_extra; uniform vec2 u_view; varying vec2 v_uv; varying vec4 v_col; varying vec4 v_shape; varying float v_radius; varying vec4 v_extra; void main(){ vec2 p=vec2(a_pos.x/u_view.x*2.0-1.0,1.0-a_pos.y/u_view.y*2.0); gl_Position=vec4(p,0.0,1.0); v_uv=a_uv; v_col=a_col; v_shape=a_shape; v_radius=a_radius; v_extra=a_extra; }";
+      |                    ^~~~~~~~~~
+[ 61%] Building C object CMakeFiles/xe.dir/src/screens/search.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:44:13: warning: ‘srequest’ defined but not used [-Wunused-function]
+   44 | static void srequest(void){if(!S.query_len)return;S.search_pending=1;S.result_ready=0;}
+      |             ^~~~~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/screens/search.c:43:12: warning: ‘sbutton’ defined but not used [-Wunused-function]
+   43 | static int sbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_focusable(id,r),a=xe_ui_activated(id);sbox(r,sd(8),primary?S_RED:(XeColor){0.15f,0.15f,0.18f,1});if(f)xe_r_border(r,sd(8),sd(2),S_WHITE);xe_label_box(label,r.x+sd(8),r.y+sd(9),sd(13),600,r.w-sd(16),1,1,S_WHITE);return a;}
+      |            ^~~~~~~
+[ 66%] Building C object CMakeFiles/xe.dir/src/screens/splash.c.o
+[ 71%] Building C object CMakeFiles/xe.dir/src/text/text.c.o
+[ 76%] Building C object CMakeFiles/xe.dir/src/ui/anim.c.o
+[ 80%] Building C object CMakeFiles/xe.dir/src/ui/ui.c.o
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c: In function ‘xe_spring_init’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c:6:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+    6 |     if(!s) return; s->value=v; s->target=v; s->velocity=0;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c:6:20: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+    6 |     if(!s) return; s->value=v; s->target=v; s->velocity=0;
+      |                    ^
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c: In function ‘xe_ease_in_out’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c:23:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   23 |     if(t<0)t=0; if(t>1)t=1;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/anim.c:23:17: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   23 |     if(t<0)t=0; if(t>1)t=1;
+      |                 ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c: In function ‘get_anim’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:37:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   37 |     if(!create)return NULL; if(slot<0)slot=oldest;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:37:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   37 |     if(!create)return NULL; if(slot<0)slot=oldest;
+      |                             ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c: In function ‘navigate’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:43:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   43 |     if(fi<0)return id;a=prev[fi].r;ax=a.x+a.w*.5f;ay=a.y+a.h*.5f;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:43:23: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   43 |     if(fi<0)return id;a=prev[fi].r;ax=a.x+a.w*.5f;ay=a.y+a.h*.5f;
+      |                       ^
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:49:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   49 |         if(p<=.5f)continue;score=p+s*2.4f;
+      |         ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:49:28: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   49 |         if(p<=.5f)continue;score=p+s*2.4f;
+      |                            ^~~~~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c: In function ‘xe_ui_set_scroll_view’:
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:90:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   90 |     if(slot<0)return;scrolls[slot].used=1;scrolls[slot].id=id;scrolls[slot].rect=rect;scrolls[slot].offset=offset;
+      |     ^~
+/home/runner/work/Xstream-Tv/Xstream-Tv/src/ui/ui.c:90:22: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   90 |     if(slot<0)return;scrolls[slot].used=1;scrolls[slot].id=id;scrolls[slot].rect=rect;scrolls[slot].offset=offset;
+      |                      ^~~~~~~
+[ 85%] Building C object CMakeFiles/xe.dir/third_party/cjson/cJSON.c.o
+[ 90%] Linking C static library libxe.a
+[ 90%] Built target xe
+[ 95%] Building C object CMakeFiles/xstream.dir/hosts/desktop/main_sdl.c.o
+[100%] Linking C executable xstream
+[100%] Built target xstream
