@@ -25,6 +25,11 @@ jobs:
           mkdir -p ../out
           gradle --no-daemon assembleRelease 2>&1 | tee ../out/build.log
           cp app/build/outputs/apk/release/*.apk ../out/ 2>/dev/null || true
+      - name: Report errors
+        if: failure()
+        run: |
+          grep -E "^e: |error:|What went wrong|FAILED" out/build.log | head -30 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}' > errs.txt || true
+          echo "::error title=Build errors::$(cat errs.txt)"
       - name: Save logs to the ci-android branch
         if: always()
         run: |
