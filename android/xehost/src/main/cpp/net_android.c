@@ -7,6 +7,9 @@
 #include <time.h>
 
 #define BODY_LIMIT (32u * 1024u * 1024u)
+#ifndef XE_NET_CALLBACK_BUDGET_SEC
+#define XE_NET_CALLBACK_BUDGET_SEC 0.004   /* deliver callbacks for at most ~4 ms per frame */
+#endif
 extern JavaVM *xe_net_android_vm(void);
 extern jclass xe_net_android_class(void);
 extern jmethodID xe_net_android_async(void);
