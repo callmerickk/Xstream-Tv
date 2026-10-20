@@ -1,0 +1,521 @@
+### FILE: include/xe/jobs.h
+```c
+#ifndef XE_JOBS_H
+#define XE_JOBS_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* Initializes a bounded worker pool. Repeated init calls are ignored. */
+void xe_jobs_init(int threads);
+/* Stops accepting work, completes queued work, joins workers and runs pending callbacks. */
+void xe_jobs_shutdown(void);
+/* Higher priority jobs are selected first. work runs on a worker; done_on_main runs in pump. */
+void xe_jobs_submit(void (*work)(void *arg), void (*done_on_main)(void *arg), void *arg, int priority);
+/* Run completion callbacks on the calling/render thread for at most about 2 ms. */
+void xe_jobs_pump(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/jobs/jobs.c
+```c
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include "xe/jobs.h"
+#include "xe/platform.h"
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+typedef CRITICAL_SECTION XeMutex; typedef CONDITION_VARIABLE XeCond; typedef HANDLE XeThread;
+#define M_INIT(m) InitializeCriticalSection(m)
+#define M_LOCK(m) EnterCriticalSection(m)
+#define M_UNLOCK(m) LeaveCriticalSection(m)
+#define M_DESTROY(m) DeleteCriticalSection(m)
+#define C_INIT(c) InitializeConditionVariable(c)
+#define C_WAIT(c,m) SleepConditionVariableCS(c,m,INFINITE)
+#define C_SIGNAL(c) WakeConditionVariable(c)
+#define C_BROADCAST(c) WakeAllConditionVariable(c)
+static DWORD WINAPI xe_worker(void *p);
+#else
+#include <pthread.h>
+#include <errno.h>
+typedef pthread_mutex_t XeMutex; typedef pthread_cond_t XeCond; typedef pthread_t XeThread;
+#define M_INIT(m) pthread_mutex_init(m,NULL)
+#define M_LOCK(m) pthread_mutex_lock(m)
+#define M_UNLOCK(m) pthread_mutex_unlock(m)
+#define M_DESTROY(m) pthread_mutex_destroy(m)
+#define C_INIT(c) pthread_cond_init(c,NULL)
+#define C_WAIT(c,m) pthread_cond_wait(c,m)
+#define C_SIGNAL(c) pthread_cond_signal(c)
+#define C_BROADCAST(c) pthread_cond_broadcast(c)
+static void *xe_worker(void *p);
+#endif
+
+typedef struct XeJob { void (*work)(void*); void (*done)(void*); void *arg; int priority; unsigned long long seq; struct XeJob *next; } XeJob;
+static struct { XeMutex mu; XeCond cv; XeThread *threads; int nthreads, initialized, stopping; XeJob *queued, *completed; unsigned long long seq; } g;
+static void queue_insert(XeJob **head, XeJob *j, int by_priority) {
+    XeJob **p=head;
+    if (by_priority) while (*p && ((*p)->priority > j->priority || ((*p)->priority==j->priority && (*p)->seq<j->seq))) p=&(*p)->next;
+    else { while (*p) p=&(*p)->next; }
+    j->next=*p; *p=j;
+}
+#ifdef _WIN32
+static DWORD WINAPI xe_worker(void *unused)
+#else
+static void *xe_worker(void *unused)
+#endif
+{
+    (void)unused;
+    for (;;) {
+        M_LOCK(&g.mu);
+        while (!g.queued && !g.stopping) C_WAIT(&g.cv,&g.mu);
+        if (!g.queued && g.stopping) { M_UNLOCK(&g.mu); break; }
+        XeJob *j=g.queued; g.queued=j->next; j->next=NULL;
+        M_UNLOCK(&g.mu);
+        j->work(j->arg);
+        M_LOCK(&g.mu); queue_insert(&g.completed,j,0); M_UNLOCK(&g.mu);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+void xe_jobs_init(int threads) {
+    if (g.initialized) return;
+    memset(&g,0,sizeof(g)); M_INIT(&g.mu); C_INIT(&g.cv);
+    if (threads<1) threads=2;
+    if (threads>8) threads=8;
+    g.threads=(XeThread*)calloc((size_t)threads,sizeof(XeThread));
+    if (!g.threads) { M_DESTROY(&g.mu); return; }
+    g.initialized=1;
+    for (int i=0;i<threads;i++) {
+#ifdef _WIN32
+        g.threads[i]=CreateThread(NULL,0,xe_worker,NULL,0,NULL);
+        if (!g.threads[i]) break;
+#else
+        if (pthread_create(&g.threads[i],NULL,xe_worker,NULL)!=0) break;
+#endif
+        g.nthreads++;
+    }
+    if (!g.nthreads) { free(g.threads); g.threads=NULL; g.initialized=0; M_DESTROY(&g.mu); }
+}
+void xe_jobs_submit(void (*work)(void*), void (*done)(void*), void *arg, int priority) {
+    if (!work) return;
+    if (!g.initialized) xe_jobs_init(2);
+    if (!g.initialized) { xe_log(3,"xe_jobs_submit: worker pool unavailable; dropping job"); return; }
+    XeJob *j=(XeJob*)calloc(1,sizeof(*j));
+    if (!j) { xe_log(3,"xe_jobs_submit: out of memory; dropping job"); return; }
+    j->work=work; j->done=done; j->arg=arg; j->priority=priority;
+    M_LOCK(&g.mu); j->seq=++g.seq;
+    if (g.stopping) { M_UNLOCK(&g.mu); free(j); return; }
+    queue_insert(&g.queued,j,1); C_SIGNAL(&g.cv); M_UNLOCK(&g.mu);
+}
+static double now_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq; LARGE_INTEGER n; if(!freq.QuadPart) QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&n); return 1000.0*(double)n.QuadPart/(double)freq.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec*1000.0+(double)ts.tv_nsec/1000000.0;
+#endif
+}
+void xe_jobs_pump(void) {
+    if (!g.initialized) return;
+    double until=now_ms()+2.0;
+    do { M_LOCK(&g.mu); XeJob *j=g.completed; if(j) {g.completed=j->next;} M_UNLOCK(&g.mu); if(!j) break; if(j->done) j->done(j->arg); free(j); } while(now_ms()<until);
+}
+void xe_jobs_shutdown(void) {
+    if(!g.initialized) return;
+    M_LOCK(&g.mu); g.stopping=1; C_BROADCAST(&g.cv); M_UNLOCK(&g.mu);
+    for(int i=0;i<g.nthreads;i++) {
+#ifdef _WIN32
+        WaitForSingleObject(g.threads[i],INFINITE); CloseHandle(g.threads[i]);
+#else
+        pthread_join(g.threads[i],NULL);
+#endif
+    }
+    free(g.threads); g.threads=NULL;
+    /* Shutdown is a lifecycle boundary: deliver all completions on the caller. */
+    for(;;) { M_LOCK(&g.mu); XeJob *j=g.completed; if(j) g.completed=j->next; M_UNLOCK(&g.mu); if(!j) break; if(j->done) j->done(j->arg); free(j); }
+    while(g.queued) { XeJob *j=g.queued; g.queued=j->next; free(j); }
+    M_DESTROY(&g.mu); memset(&g,0,sizeof(g));
+}
+```
+
+### FILE: include/xe/images.h
+```c
+#ifndef XE_IMAGES_H
+#define XE_IMAGES_H
+#include <stddef.h>
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct XeImage XeImage;
+/* URL and requested dimensions identify a shared, reference-counted request. */
+XeImage *xe_img_get(const char *url, int want_w, int want_h);
+/* Valid only while the caller holds a reference; NULL until uploaded and ready. */
+const XeTexture *xe_img_tex(XeImage *img);
+float xe_img_fade(XeImage *img);
+int xe_img_failed(XeImage *img);
+void xe_img_release(XeImage *img);
+/* Call on render thread once per frame; performs at most two GPU uploads. */
+void xe_img_pump(void);
+/* Byte budgets; defaults are 64 MiB GPU and 150 MiB disk. */
+void xe_img_set_budget(size_t gpu_bytes, size_t disk_bytes);
+/* Optional diagnostics for tests/telemetry. */
+size_t xe_img_gpu_bytes(void);
+size_t xe_img_disk_bytes(void);
+unsigned long xe_img_cache_hits(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/images/images.c
+```c
+#include "xe/images.h"
+#include "xe/jobs.h"
+#include "xe/platform.h"
+#include <curl/curl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#define xe_mkdir(p) _mkdir(p)
+#else
+#include <dirent.h>
+#include <unistd.h>
+#define xe_mkdir(p) mkdir((p),0700)
+#endif
+#include "stb_image.h"
+#include <webp/decode.h>
+
+#define XE_IMG_DEFAULT_GPU ((size_t)64u*1024u*1024u)
+#define XE_IMG_DEFAULT_DISK ((size_t)150u*1024u*1024u)
+typedef enum { IMG_LOADING, IMG_DECODED, IMG_READY, IMG_FAILED } ImgState;
+typedef struct ImgBytes { unsigned char *p; size_t n, cap; } ImgBytes;
+struct XeImage { char *url; int want_w,want_h,refs; ImgState state; XeTexture *tex; int has_tex, evict; unsigned char *rgba; size_t rgba_bytes; int w,h; double ready_at,last_use; char disk_path[1024]; struct XeImage *next; };
+#ifdef _WIN32
+#define IMG_MUTEX CRITICAL_SECTION
+#define IMG_LOCK(m) EnterCriticalSection(m)
+#define IMG_UNLOCK(m) LeaveCriticalSection(m)
+#else
+#include <pthread.h>
+#define IMG_MUTEX pthread_mutex_t
+#define IMG_LOCK(m) pthread_mutex_lock(m)
+#define IMG_UNLOCK(m) pthread_mutex_unlock(m)
+#endif
+static IMG_MUTEX g_mu;
+static int g_mu_init, g_curl_init;
+static XeImage *g_imgs;
+static size_t g_gpu_budget=XE_IMG_DEFAULT_GPU,g_disk_budget=XE_IMG_DEFAULT_DISK,g_gpu_bytes,g_disk_bytes;
+static unsigned long g_hits;
+static unsigned long long hash_url(const char *s,int w,int h) { uint64_t x=1469598103934665603ULL; while(*s){x^=(unsigned char)*s++;x*=1099511628211ULL;} x^=(uint32_t)w; x*=1099511628211ULL; x^=(uint32_t)h; x*=1099511628211ULL; return (unsigned long long)x; }
+static void img_lock_init(void) { if(g_mu_init)return;
+#ifdef _WIN32
+InitializeCriticalSection(&g_mu);
+#else
+pthread_mutex_init(&g_mu,NULL);
+#endif
+ g_mu_init=1; }
+static char *dupstr(const char *s) { size_t n=strlen(s)+1; char *p=(char*)malloc(n); if(p)memcpy(p,s,n); return p; }
+static size_t curl_write(char *p,size_t a,size_t b,void *ctx) { size_t n=a*b; ImgBytes *o=(ImgBytes*)ctx; if(n>64u*1024u*1024u-o->n)return 0; if(o->n+n>o->cap){size_t c=o->cap?o->cap*2:32768;while(c<o->n+n)c*=2;unsigned char *q=(unsigned char*)realloc(o->p,c);if(!q)return 0;o->p=q;o->cap=c;}memcpy(o->p+o->n,p,n);o->n+=n;return n; }
+static int read_file(const char *path, ImgBytes *b) { FILE *f=fopen(path,"rb"); if(!f)return 0; if(fseek(f,0,SEEK_END)){fclose(f);return 0;} long n=ftell(f); if(n<1||n>64*1024*1024||fseek(f,0,SEEK_SET)){fclose(f);return 0;} b->p=(unsigned char*)malloc((size_t)n); if(!b->p){fclose(f);return 0;} b->n=b->cap=(size_t)n; int ok=fread(b->p,1,b->n,f)==b->n;fclose(f);if(!ok){free(b->p);memset(b,0,sizeof(*b));}return ok; }
+static int write_file(const char *path,const void *p,size_t n) { FILE *f=fopen(path,"wb");if(!f)return 0;int ok=fwrite(p,1,n,f)==n;fclose(f);return ok; }
+static void make_cache_path(XeImage *im) { const char *dir=xe_platform_cache_dir(); if(!dir||!*dir)dir="."; snprintf(im->disk_path,sizeof(im->disk_path),"%s/xe-images-%016llx.bin",dir,hash_url(im->url,im->want_w,im->want_h)); }
+static void ensure_cache_dir(void) { const char *d=xe_platform_cache_dir(); if(d&&*d)xe_mkdir(d); }
+static void disk_recount_and_prune(void) {
+    const char *dir=xe_platform_cache_dir(); if(!dir||!*dir)return;
+    /* The engine owns only files with the xe-images- prefix. LRU uses filesystem access time. */
+    for(;;) {
+        size_t total=0; char oldest[1024]={0}; time_t oldest_t=0;
+#ifdef _WIN32
+        char pattern[1024];snprintf(pattern,sizeof(pattern),"%s\\xe-images-*.bin",dir);WIN32_FIND_DATAA fd;HANDLE h=FindFirstFileA(pattern,&fd);if(h==INVALID_HANDLE_VALUE){g_disk_bytes=0;return;}do{if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)continue;ULARGE_INTEGER z;z.LowPart=fd.nFileSizeLow;z.HighPart=fd.nFileSizeHigh;total+=(size_t)z.QuadPart;char p[1024];snprintf(p,sizeof(p),"%s\\%s",dir,fd.cFileName);struct _stat st;if(_stat(p,&st)==0&&(!oldest[0]||st.st_atime<oldest_t)){strncpy(oldest,p,sizeof(oldest)-1);oldest_t=st.st_atime;}}while(FindNextFileA(h,&fd));FindClose(h);
+#else
+        DIR *d=opendir(dir);if(!d){g_disk_bytes=0;return;}struct dirent *e;while((e=readdir(d))){if(strncmp(e->d_name,"xe-images-",10)||!strstr(e->d_name,".bin"))continue;char p[1024];snprintf(p,sizeof(p),"%s/%s",dir,e->d_name);struct stat st;if(stat(p,&st))continue;total+=(size_t)st.st_size;if(!oldest[0]||st.st_atime<oldest_t){strncpy(oldest,p,sizeof(oldest)-1);oldest_t=st.st_atime;}}closedir(d);
+#endif
+        g_disk_bytes=total;if(total<=g_disk_budget||!oldest[0])break;remove(oldest);
+    }
+}
+static void downscale_box(unsigned char **pixels,int *w,int *h,int target_w,int target_h) {
+    int sw=*w,sh=*h; if(target_w<=0)target_w=sw;if(target_h<=0)target_h=sh;
+    double scale=(double)target_w/sw;if((double)target_h/sh<scale)scale=(double)target_h/sh;if(scale>=1.0)return;
+    int dw=(int)(sw*scale),dh=(int)(sh*scale);if(dw<1)dw=1;if(dh<1)dh=1;
+    unsigned char *out=(unsigned char*)malloc((size_t)dw*dh*4);if(!out)return;
+    for(int y=0;y<dh;y++){int y0=(int)((long long)y*sh/dh),y1=(int)((long long)(y+1)*sh/dh);if(y1<=y0)y1=y0+1;for(int x=0;x<dw;x++){int x0=(int)((long long)x*sw/dw),x1=(int)((long long)(x+1)*sw/dw);if(x1<=x0)x1=x0+1;unsigned sum[4]={0,0,0,0};unsigned count=0;for(int sy=y0;sy<y1&&sy<sh;sy++)for(int sx=x0;sx<x1&&sx<sw;sx++){const unsigned char *q=*pixels+((size_t)sy*sw+sx)*4;for(int c=0;c<4;c++)sum[c]+=q[c];count++;}unsigned char *d=out+((size_t)y*dw+x)*4;for(int c=0;c<4;c++)d[c]=(unsigned char)(sum[c]/(count?count:1));}}
+    free(*pixels);*pixels=out;*w=dw;*h=dh;
+}
+static unsigned char *decode_image(const unsigned char *data,size_t n,int *w,int *h,int want_w,int want_h) {
+    unsigned char *rgba=NULL; int ok=0;
+    if(n>=12&&!memcmp(data,"RIFF",4)&&!memcmp(data+8,"WEBP",4)){unsigned char *webp=WebPDecodeRGBA(data,n,w,h);if(webp){size_t bytes=(size_t)(*w)*(*h)*4;rgba=(unsigned char*)malloc(bytes);if(rgba)memcpy(rgba,webp,bytes);WebPFree(webp);ok=rgba!=NULL;}}
+    else {int ch=0;rgba=stbi_load_from_memory(data,(int)n,w,h,&ch,4);ok=rgba!=NULL;}
+    if(!ok)return NULL;
+    downscale_box(&rgba,w,h,want_w,want_h);return rgba;
+}
+static void image_work(void *arg) {
+    XeImage *im=(XeImage*)arg; ImgBytes b={0}; make_cache_path(im); ensure_cache_dir();
+    int cached=read_file(im->disk_path,&b);
+    if(!cached) {
+        CURL *c=curl_easy_init(); if(c){curl_easy_setopt(c,CURLOPT_URL,im->url);curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);curl_easy_setopt(c,CURLOPT_MAXREDIRS,5L);curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,12L);curl_easy_setopt(c,CURLOPT_TIMEOUT,25L);curl_easy_setopt(c,CURLOPT_USERAGENT,"XE/1.0 image-cache");curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,curl_write);curl_easy_setopt(c,CURLOPT_WRITEDATA,&b);curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);CURLcode rc=curl_easy_perform(c);long status=0;curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&status);curl_easy_cleanup(c);if(rc!=CURLE_OK||status<200||status>=300){free(b.p);b.p=NULL;b.n=0;}}
+        if(b.p) { if(write_file(im->disk_path,b.p,b.n)){IMG_LOCK(&g_mu);disk_recount_and_prune();IMG_UNLOCK(&g_mu);} }
+    }
+    int w=0,h=0;unsigned char *rgba=b.p?decode_image(b.p,b.n,&w,&h,im->want_w,im->want_h):NULL;free(b.p);
+    IMG_LOCK(&g_mu);if(rgba){im->rgba=rgba;im->rgba_bytes=(size_t)w*h*4;im->w=w;im->h=h;im->state=IMG_DECODED;}else im->state=IMG_FAILED;IMG_UNLOCK(&g_mu);
+}
+static void image_done(void *arg) { (void)arg; /* Upload is deliberately deferred to xe_img_pump on the render thread. */ }
+static void evict_gpu(void) {
+    while(g_gpu_bytes>g_gpu_budget){XeImage *victim=NULL;for(XeImage *p=g_imgs;p;p=p->next)if(p->has_tex&&p->refs==0&&(!victim||p->last_use<victim->last_use))victim=p;if(!victim)break;xe_tex_destroy(victim->tex);victim->tex=NULL;victim->has_tex=0;g_gpu_bytes-=(size_t)victim->w*victim->h*4;victim->state=IMG_DECODED;}
+}
+XeImage *xe_img_get(const char *url,int want_w,int want_h) {
+    if(!url||!*url)return NULL;img_lock_init();if(!g_curl_init){curl_global_init(CURL_GLOBAL_DEFAULT);g_curl_init=1;}if(want_w<1)want_w=342;if(want_h<1)want_h=512;
+    IMG_LOCK(&g_mu);for(XeImage *p=g_imgs;p;p=p->next)if(p->want_w==want_w&&p->want_h==want_h&&!strcmp(p->url,url)&&!p->evict){p->refs++;p->last_use=(double)time(NULL);g_hits++;IMG_UNLOCK(&g_mu);return p;}
+    XeImage *im=(XeImage*)calloc(1,sizeof(*im));if(!im){IMG_UNLOCK(&g_mu);return NULL;}im->url=dupstr(url);if(!im->url){free(im);IMG_UNLOCK(&g_mu);return NULL;}im->want_w=want_w;im->want_h=want_h;im->refs=1;im->state=IMG_LOADING;im->last_use=(double)time(NULL);im->next=g_imgs;g_imgs=im;IMG_UNLOCK(&g_mu);
+    xe_jobs_submit(image_work,image_done,im,5);return im;
+}
+const XeTexture *xe_img_tex(XeImage *im) { if(!im)return NULL;img_lock_init();IMG_LOCK(&g_mu);const XeTexture *t=im->has_tex?im->tex:NULL;im->last_use=(double)time(NULL);IMG_UNLOCK(&g_mu);return t; }
+float xe_img_fade(XeImage *im) { if(!im)return 0;IMG_LOCK(&g_mu);float f=0;if(im->state==IMG_READY){double d=xe_time_now()-im->ready_at;f=(float)(d/0.180);if(f>1)f=1;if(f<0)f=0;}IMG_UNLOCK(&g_mu);return f; }
+int xe_img_failed(XeImage *im) { if(!im)return 1;IMG_LOCK(&g_mu);int v=im->state==IMG_FAILED;IMG_UNLOCK(&g_mu);return v; }
+void xe_img_release(XeImage *im) { if(!im)return;IMG_LOCK(&g_mu);if(im->refs>0)im->refs--;if(!im->refs)im->evict=1;IMG_UNLOCK(&g_mu); }
+void xe_img_pump(void) {
+    if(!g_mu_init)return;xe_jobs_pump();int uploaded=0;
+    IMG_LOCK(&g_mu);XeImage *p=g_imgs;IMG_UNLOCK(&g_mu);
+    for(;p&&uploaded<2;p=p->next){IMG_LOCK(&g_mu);int can=p->state==IMG_DECODED&&p->rgba&&p->refs>0;unsigned char *rgba=can?p->rgba:NULL;int w=p->w,h=p->h;IMG_UNLOCK(&g_mu);if(!can)continue;
+        XeTexture *t=xe_tex_create(w,h,rgba);IMG_LOCK(&g_mu);if(t&&p->state==IMG_DECODED){p->tex=t;p->has_tex=1;p->state=IMG_READY;p->ready_at=xe_time_now();g_gpu_bytes+=(size_t)w*h*4;free(p->rgba);p->rgba=NULL;p->rgba_bytes=0;uploaded++;}else if(t){xe_tex_destroy(t);}IMG_UNLOCK(&g_mu);
+    }
+    IMG_LOCK(&g_mu);evict_gpu();XeImage **link=&g_imgs;while(*link){XeImage *im=*link;if(im->evict&&im->state!=IMG_LOADING){*link=im->next;if(im->has_tex){xe_tex_destroy(im->tex);g_gpu_bytes-=(size_t)im->w*im->h*4;}free(im->rgba);free(im->url);free(im);}else link=&im->next;}disk_recount_and_prune();IMG_UNLOCK(&g_mu);
+}
+void xe_img_set_budget(size_t gpu,size_t disk) { img_lock_init();IMG_LOCK(&g_mu);g_gpu_budget=gpu;g_disk_budget=disk;evict_gpu();disk_recount_and_prune();IMG_UNLOCK(&g_mu); }
+size_t xe_img_gpu_bytes(void){img_lock_init();IMG_LOCK(&g_mu);size_t n=g_gpu_bytes;IMG_UNLOCK(&g_mu);return n;}
+size_t xe_img_disk_bytes(void){img_lock_init();IMG_LOCK(&g_mu);disk_recount_and_prune();size_t n=g_disk_bytes;IMG_UNLOCK(&g_mu);return n;}
+unsigned long xe_img_cache_hits(void){img_lock_init();IMG_LOCK(&g_mu);unsigned long n=g_hits;IMG_UNLOCK(&g_mu);return n;}
+```
+
+### FILE: tests/p5_test.c
+```c
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/images.h"
+#include "xe/jobs.h"
+#include <stdio.h>
+#include <string.h>
+
+static XeImage *images[60];
+static int scroll_rows;
+static int screen_w=1280, screen_h=720;
+static const char *paths[60]={
+"/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg","/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg","/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg","/9O1Iy9od7zoBr2WymuL9d7ZqW2g.jpg","/7WsyChQLEftFiDOVTGkv3hFpyyt.jpg","/rAiYTfKGqDCRIIqo664sY9n8P.jpg",
+"/or06FN3Dka5tukK1e9sl16pB3iy.jpg","/uXDfjJbdP4ijW5hWSBrPrlKpxab.jpg","/q719jXXEzOoYaps6Cab00t6Fx2H.jpg","/xBHvZcjRiWyobQ9kxBhO6B2dtRI.jpg","/5KCVkau1HEl7ZzfPsKAPM0sMiKc.jpg","/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg",
+"/pIkRyD18kl4FhoCNQuWxWu5cBLM.jpg","/zGVbr7PR9dY7qL7y8eY.jpg","/a4BfxRK8dBgbQqbRxPs8kmLd8LG.jpg","/9O7gLzmreU0nGkIB6K3BsJbzvNv.jpg","/h8gHn0OzBoaefsYseUByqsmEDMY.jpg","/qJ2tW6WMUDux911r6m7haRef0WH.jpg",
+"/d5NXSklXo0qyIYkgV94XAgMIckC.jpg","/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg","/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg","/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg","/or06FN3Dka5tukK1e9sl16pB3iy.jpg","/uXDfjJbdP4ijW5hWSBrPrlKpxab.jpg",
+"/q719jXXEzOoYaps6Cab00t6Fx2H.jpg","/xBHvZcjRiWyobQ9kxBhO6B2dtRI.jpg","/5KCVkau1HEl7ZzfPsKAPM0sMiKc.jpg","/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg","/pIkRyD18kl4FhoCNQuWxWu5cBLM.jpg","/a4BfxRK8dBgbQqbRxPs8kmLd8LG.jpg",
+"/9O7gLzmreU0nGkIB6K3BsJbzvNv.jpg","/h8gHn0OzBoaefsYseUByqsmEDMY.jpg","/qJ2tW6WMUDux911r6m7haRef0WH.jpg","/d5NXSklXo0qyIYkgV94XAgMIckC.jpg","/9O1Iy9od7zoBr2WymuL9d7ZqW2g.jpg","/rAiYTfKGqDCRIIqo664sY9n8P.jpg",
+"/zGVbr7PR9dY7qL7y8eY.jpg","/7WsyChQLEftFiDOVTGkv3hFpyyt.jpg","/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg","/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg","/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg","/or06FN3Dka5tukK1e9sl16pB3iy.jpg",
+"/uXDfjJbdP4ijW5hWSBrPrlKpxab.jpg","/q719jXXEzOoYaps6Cab00t6Fx2H.jpg","/xBHvZcjRiWyobQ9kxBhO6B2dtRI.jpg","/5KCVkau1HEl7ZzfPsKAPM0sMiKc.jpg","/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg","/pIkRyD18kl4FhoCNQuWxWu5cBLM.jpg",
+"/a4BfxRK8dBgbQqbRxPs8kmLd8LG.jpg","/9O7gLzmreU0nGkIB6K3BsJbzvNv.jpg","/h8gHn0OzBoaefsYseUByqsmEDMY.jpg","/qJ2tW6WMUDux911r6m7haRef0WH.jpg","/d5NXSklXo0qyIYkgV94XAgMIckC.jpg","/9O1Iy9od7zoBr2WymuL9d7ZqW2g.jpg",
+"/rAiYTfKGqDCRIIqo664sY9n8P.jpg","/7WsyChQLEftFiDOVTGkv3hFpyyt.jpg","/zGVbr7PR9dY7qL7y8eY.jpg","/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg","/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg","/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg"
+};
+int xe_app_init(void) {
+    xe_jobs_init(3); xe_img_set_budget(64u*1024u*1024u,150u*1024u*1024u);
+    for(int i=0;i<60;i++){char url[512];snprintf(url,sizeof(url),"https://image.tmdb.org/t/p/w342%s",paths[i]);images[i]=xe_img_get(url,342,513);}
+    xe_platform_set_wants_frames(1); return 1;
+}
+void xe_app_frame(double dt) {
+    (void)dt; XeEvent ev;
+    while(xe_platform_poll(&ev)) {
+        if(ev.type==XE_EV_KEY_DOWN&&ev.key==XE_KEY_DOWN)scroll_rows++;
+        if(ev.type==XE_EV_KEY_DOWN&&ev.key==XE_KEY_UP&&scroll_rows>0)scroll_rows--;
+        if(ev.type==XE_EV_SCROLL)scroll_rows+=(int)(ev.dy>0?1:-1);
+        if(scroll_rows<0)scroll_rows=0;if(scroll_rows>12)scroll_rows=12;
+        if(ev.type==XE_EV_RESIZE){screen_w=ev.w;screen_h=ev.h;}
+    }
+    xe_img_pump();xe_r_begin(screen_w,screen_h);
+    XeColor bg={0.035f,0.045f,0.07f,1};xe_r_rect((XeRect){0,0,(float)screen_w,(float)screen_h},0,bg);
+    const float pad=18, cardw=148, cardh=218, gap=14;int cols=(int)((screen_w-pad*2)/(cardw+gap));if(cols<1)cols=1;
+    xe_r_push_clip((XeRect){0,0,(float)screen_w,(float)screen_h},0);
+    for(int i=0;i<60;i++){int row=i/cols,col=i%cols;float x=pad+col*(cardw+gap),y=pad+row*(cardh+gap)-scroll_rows* (cardh+gap);if(y+cardh<0||y>screen_h)continue;
+        XeColor shell={0.12f,0.14f,0.19f,1};xe_r_rect((XeRect){x,y,cardw,cardh},10,shell);
+        const XeTexture *t=xe_img_tex(images[i]);if(t)xe_r_image(t,(XeRect){x,y,cardw,cardh},10,xe_img_fade(images[i]),0);
+        if(xe_img_failed(images[i])){XeColor err={0.35f,0.08f,0.1f,1};xe_r_rect((XeRect){x,y,cardw,cardh},10,err);}
+    }
+    xe_r_pop_clip();xe_r_end();
+    static double report=0;report+=dt;if(report>=1.0){report=0;printf("P5 images: GPU=%zu bytes disk=%zu bytes hits=%lu scroll=%d\n",xe_img_gpu_bytes(),xe_img_disk_bytes(),xe_img_cache_hits(),scroll_rows);}
+    xe_platform_set_wants_frames(1);
+}
+void xe_app_shutdown(void){for(int i=0;i<60;i++)xe_img_release(images[i]);xe_jobs_shutdown();}
+```
+
+### FILE: CMakeLists.txt
+```cmake
+cmake_minimum_required(VERSION 3.22)
+project(xe C)
+option(XE_GLES "Build OpenGL ES renderer" OFF)
+option(XE_BUILD_WINDOWS_HOST "Build SDL2 Windows host" ON)
+option(XE_BUILD_P1_TEST "Build P1 test application" ON)
+option(XE_BUILD_P3_TEST "Build P3 renderer test application" OFF)
+option(XE_BUILD_P5_TEST "Build P5 image-grid test application" OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+file(GLOB_RECURSE XE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+add_library(xe STATIC ${XE_SOURCES})
+target_include_directories(xe PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_compile_definitions(xe PUBLIC $<$<BOOL:${XE_GLES}>:XE_GLES=1>)
+if(NOT WIN32 AND NOT ANDROID AND NOT XE_GLES)
+  target_compile_definitions(xe PRIVATE XE_RENDER_NO_GL=1)
+endif()
+find_package(Threads REQUIRED)
+target_link_libraries(xe PUBLIC Threads::Threads)
+# P5 image pipeline dependencies: install curl and libwebp development packages and provide stb_image.h.
+find_package(CURL REQUIRED)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+  target_link_libraries(xe PUBLIC CURL::libcurl PkgConfig::WEBP)
+else()
+  find_path(WEBP_INCLUDE_DIR webp/decode.h REQUIRED)
+  find_library(WEBP_LIBRARY NAMES webp REQUIRED)
+  target_include_directories(xe PRIVATE ${WEBP_INCLUDE_DIR})
+  target_link_libraries(xe PUBLIC CURL::libcurl ${WEBP_LIBRARY})
+endif()
+if(MSVC)
+  target_compile_options(xe PRIVATE /W4)
+else()
+  target_compile_options(xe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+if(WIN32 AND XE_BUILD_WINDOWS_HOST)
+  find_package(SDL2 CONFIG QUIET)
+  if(TARGET SDL2::SDL2)
+    set(XE_SDL_TARGET SDL2::SDL2)
+  elseif(TARGET SDL2::SDL2-static)
+    set(XE_SDL_TARGET SDL2::SDL2-static)
+  else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL2_PC REQUIRED IMPORTED_TARGET sdl2)
+    set(XE_SDL_TARGET PkgConfig::SDL2_PC)
+  endif()
+  add_executable(xe_win hosts/windows/main_sdl.c)
+  target_link_libraries(xe_win PRIVATE xe ${XE_SDL_TARGET} opengl32)
+  target_compile_definitions(xe_win PRIVATE SDL_MAIN_HANDLED)
+  if(XE_BUILD_P5_TEST)
+    target_sources(xe_win PRIVATE tests/p5_test.c)
+  elseif(XE_BUILD_P3_TEST)
+    target_sources(xe_win PRIVATE tests/p3_test.c)
+  elseif(XE_BUILD_P1_TEST)
+    target_sources(xe_win PRIVATE tests/p1_test.c)
+  endif()
+endif()
+# Android Gradle should build xe with the Android NDK, libcurl, libwebp and stb_image dependencies configured for that ABI.
+```
+
+### FILE: README_P5.md
+```text
+# XE P5 — jobs and image cache
+
+## New public files
+- `include/xe/jobs.h`: priority worker pool and render-thread completion pump.
+- `include/xe/images.h`: URL+size image handles, render-thread texture upload, fade, budgets and diagnostics.
+- `src/jobs/jobs.c`: pthreads on POSIX/Android and Win32 threads on Windows.
+- `src/images/images.c`: libcurl downloads, disk cache, stb_image/libwebp decode, box downscale, render-thread uploads and byte-budget GPU LRU.
+- `tests/p5_test.c`: 60-image TMDB poster grid, D-pad scrolling, and cache telemetry.
+
+## Dependencies / P6 integration assumption
+The P6 `include/xe/net.h` was not supplied in the prompt, so this part uses libcurl directly in the image worker rather than inventing a net API. When P6's contract is available, replace the small download helper with that API without changing `xe/images.h`. The source expects `stb_image.h` in `third_party/` and the platform's libcurl and libwebp development libraries. No dependency source is bundled here.
+
+Use only permissively licensed dependencies: libcurl (curl license), libwebp (BSD), and stb_image (public domain/MIT dual option). No GPL code is used.
+
+## Threading / lifecycle
+Call `xe_jobs_init()` once after platform setup. Call `xe_img_pump()` once per render frame on the GL context thread; it pumps worker completions and uploads no more than two decoded textures per call. Release every image handle when no longer needed. Call `xe_jobs_shutdown()` during application shutdown, before destroying platform state. `xe_img_set_budget()` defaults to 64 MiB GPU and 150 MiB disk.
+
+## Build
+The supplied CMake file is a complete root example for this P5 integration. Install CMake 3.22+, SDL2 on Windows, libcurl, libwebp, and place the upstream `stb_image.h` in `third_party/`. Then:
+
+```sh
+cmake -S . -B build -DXE_BUILD_P5_TEST=ON -DXE_BUILD_P1_TEST=OFF -DXE_BUILD_P3_TEST=OFF
+cmake --build build --config Release
+```
+
+Run `build/Release/xe_win.exe` on Windows. Arrow up/down scroll the poster grid. This test requires network access to `image.tmdb.org`.
+
+## Limitations
+- TMDB URLs are supplied as already-sized image URLs by the caller; this layer does not parse TMDB or metahub URLs to rewrite size paths because doing so could corrupt arbitrary URLs.
+- Disk pruning uses file access time for files with the private `xe-images-*.bin` prefix in the configured cache directory. Filesystems that disable access-time updates provide approximate rather than exact LRU ordering.
+- Network downloads are capped at 64 MiB per image and have connection/overall timeouts. Images are not decoded on the render thread.
+```
+
+### FILE: third_party/README.md
+```text
+# Third-party dependencies
+
+XE does not bundle third-party implementation code. Place dependencies in the build environment or vendor only the permitted upstream headers/libraries as your project policy allows.
+
+- **SDL2** (Windows host): https://github.com/libsdl-org/SDL — zlib license.
+- **FreeType** (text subsystem): https://gitlab.freedesktop.org/freetype/freetype — FreeType License (FTL) / GPL dual licensing; use the FTL option only.
+- **HarfBuzz** (text shaping): https://github.com/harfbuzz/harfbuzz — MIT license.
+- **stb_image** (image decoding): https://github.com/nothings/stb — public domain or MIT, at user's choice. Put `stb_image.h` in `third_party/` for P5.
+- **libwebp** (WebP decoding): https://chromium.googlesource.com/webm/libwebp — BSD-style license.
+- **libcurl** (HTTP downloads): https://github.com/curl/curl — curl license.
+- **cJSON** (JSON): https://github.com/DaveGamble/cJSON — MIT license.
+- **libmpv** (Windows video rendering): https://github.com/mpv-player/mpv — LGPL 2.1-or-later; comply with its relinking and distribution requirements.
+- **ExoPlayer / AndroidX Media3** (Android video playback): https://github.com/androidx/media — Apache-2.0.
+
+P5 uses libcurl and libwebp at link time and expects the `stb_image.h` header supplied by the integrator. No dependency code is included in this hand-back. No GPL-only implementation is used by XE; when selecting FreeType builds, choose the FTL licensing option.
+```
+
+### SUMMARY
+```json
+{
+  "part": "P5",
+  "files": [
+    "include/xe/jobs.h",
+    "src/jobs/jobs.c",
+    "include/xe/images.h",
+    "src/images/images.c",
+    "tests/p5_test.c",
+    "CMakeLists.txt",
+    "README_P5.md",
+    "third_party/README.md"
+  ],
+  "public_api": [
+    "void xe_jobs_init(int threads);",
+    "void xe_jobs_shutdown(void);",
+    "void xe_jobs_submit(void (*work)(void *arg), void (*done_on_main)(void *arg), void *arg, int priority);",
+    "void xe_jobs_pump(void);",
+    "XeImage *xe_img_get(const char *url, int want_w, int want_h);",
+    "const XeTexture *xe_img_tex(XeImage *img);",
+    "float xe_img_fade(XeImage *img);",
+    "int xe_img_failed(XeImage *img);",
+    "void xe_img_release(XeImage *img);",
+    "void xe_img_pump(void);",
+    "void xe_img_set_budget(size_t gpu_bytes, size_t disk_bytes);",
+    "size_t xe_img_gpu_bytes(void);",
+    "size_t xe_img_disk_bytes(void);",
+    "unsigned long xe_img_cache_hits(void);"
+  ],
+  "depends_on": ["P1 platform API", "P3 render API", "libcurl", "stb_image", "libwebp", "Threads"],
+  "assumptions": [
+    "P1 platform.h and P3 render.h match the APIs supplied earlier in this conversation.",
+    "P6 net.h was not included in the prompt, so the worker currently uses libcurl directly and can be adapted when P6's exact contract is supplied.",
+    "stb_image.h is supplied by the integrator in third_party; dependency source code is not bundled.",
+    "The caller invokes xe_img_pump and texture budget changes on the GL/render thread.",
+    "Image URLs are already sized by the caller (for example TMDB /t/p/w342/); URL rewriting is intentionally not guessed for arbitrary hosts."
+  ],
+  "not_done": [
+    "Integration with the unavailable P6 net.h API.",
+    "Android NDK builds require libcurl and libwebp built and linked for each configured ABI.",
+    "The provided Windows/Android builds and GPU upload path have not been runtime-verified here."
+  ],
+  "how_to_test": "Install CMake 3.22+, SDL2 (Windows), libcurl, libwebp, and third_party/stb_image.h. Configure with cmake -S . -B build -DXE_BUILD_P5_TEST=ON -DXE_BUILD_P1_TEST=OFF -DXE_BUILD_P3_TEST=OFF; build with cmake --build build --config Release; run build/Release/xe_win.exe. Use Up/Down to scroll and inspect once-per-second GPU/disk bytes and cache-hit logging."
+}
+```

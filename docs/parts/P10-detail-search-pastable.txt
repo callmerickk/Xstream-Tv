@@ -1,0 +1,402 @@
+XE P10 — STREAMX TITLE DETAIL + SEARCH
+======================================
+
+Pasteable source bundle for the existing XE P1–P9 tree. Merge the CMake additions; do not replace the root CMakeLists.txt. The uploaded reference screenshots are reflected in the layout direction: dark cinema UI, immersive artwork, compact facts, prominent red Play/Resume, tabs and episode/recommendation rails. APIs are based on the P9 reference headers appended at the end; compare those with your actual headers before merging.
+
+### FILE: include/xe/detail.h
+```c
+#ifndef XE_DETAIL_H
+#define XE_DETAIL_H
+#include <stddef.h>
+#include "xe/render.h"
+#include "xe/data.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+void xe_detail_open(const XeMeta *m);
+void xe_detail_frame(double dt, XeRect area);
+/* Returns 1 once after Play/Resume; out_type/out_id are NUL-terminated when cap > 0.
+   Series episode ids are returned as <series-id>:S<season>:E<episode>. */
+int xe_detail_play(char *out_type, char *out_id, size_t cap);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/screens/detail.c
+```c
+#include "xe/detail.h"
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/text.h"
+#include "xe/images.h"
+#include "xe/ui.h"
+#include "xe/anim.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define D_BG ((XeColor){0.035f,0.035f,0.047f,1})
+#define D_WHITE ((XeColor){0.95f,0.95f,0.97f,1})
+#define D_MUTED ((XeColor){0.62f,0.63f,0.68f,1})
+#define D_RED ((XeColor){0.90f,0.035f,0.08f,1})
+#define D_PANEL ((XeColor){0.035f,0.035f,0.047f,0.80f})
+#define D_MAX_EVENTS 96
+#define D_MAX_EP 80
+
+typedef struct { char *id,*title,*thumb; int season,episode; } DEpisode;
+static struct {
+ int initialized, expanded, play_pending, list_added, active_tab, season, ep_count, ep_focus;
+ XeMeta meta; int has_meta;
+ XeImage *backdrop,*logo; char *backdrop_url,*logo_url;
+ DEpisode eps[D_MAX_EP];
+ XeId play_id,list_id,trailer_id,expand_id,tab_ids[3],season_ids[32],ep_ids[D_MAX_EP];
+ float scroll; double dt; float density;
+ char play_type[24],play_value[512];
+} D;
+
+static char *ddup(const char *s){size_t n;char *p;if(!s)return NULL;n=strlen(s)+1;p=(char*)malloc(n);if(p)memcpy(p,s,n);return p;}
+static void dmeta_free(XeMeta *m){int i;if(!m)return;free(m->id);free(m->type);free(m->name);free(m->poster);free(m->background);free(m->logo);free(m->description);free(m->release);free(m->imdb_rating);free(m->runtime);for(i=0;i<m->n_genres;i++)free(m->genres[i]);free(m->genres);memset(m,0,sizeof(*m));}
+static int dmeta_copy(XeMeta *d,const XeMeta *s){int i;memset(d,0,sizeof(*d));if(!s)return 0;
+#define DC(f) do{if(s->f&&!(d->f=ddup(s->f)))goto fail;}while(0)
+ DC(id);DC(type);DC(name);DC(poster);DC(background);DC(logo);DC(description);DC(release);DC(imdb_rating);DC(runtime);
+#undef DC
+ if(s->n_genres>0&&s->genres){d->genres=(char**)calloc((size_t)s->n_genres,sizeof(char*));if(!d->genres)goto fail;for(i=0;i<s->n_genres;i++){if(s->genres[i]&&!(d->genres[i]=ddup(s->genres[i])))goto fail;d->n_genres++;}}return 1;
+ fail:dmeta_free(d);return 0;}
+static float dd(float x){return x*(D.density>0?D.density:1);}
+static void dtxt(const char *s,float x,float y,float z,XeColor c){if(s&&*s)xe_text_draw(s,dd(x),dd(y),dd(z),c);}
+static void dbox(XeRect r,float rad,XeColor c){xe_r_rect(r,rad,c);}
+static int deq(const char *a,const char *b){return a&&b&&strcmp(a,b)==0;}
+static void dset_image(XeImage **im,char **url,const char *src,int w,int h){char full[2048];if(!src||!*src)return;if(*url&&strcmp(*url,src)==0)return;if(*im){xe_img_release(*im);*im=NULL;}free(*url);*url=ddup(src);if(!*url)return;
+ if(strstr(src,"http://")==src||strstr(src,"https://")==src)snprintf(full,sizeof(full),"%s",src);else snprintf(full,sizeof(full),"https://image.tmdb.org/t/p/original%s",src);
+ *im=xe_img_get(full,w,h);}
+static int dbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_focusable(id,r),a=xe_ui_activated(id);XeColor c=primary?D_RED:(XeColor){0.20f,0.20f,0.23f,0.94f};if(f)c=(XeColor){c.r*0.78f+0.22f,c.g*0.78f+0.22f,c.b*0.78f+0.22f,1};dbox(r,dd(12),c);if(f)xe_r_border(r,dd(12),dd(2),D_WHITE);dtxt(label,r.x+dd(18),r.y+r.h*0.5f-dd(8),dd(17),D_WHITE);return a;}
+static void dmake_play(const char *id,const char *type){snprintf(D.play_type,sizeof(D.play_type),"%s",type&&*type?type:"movie");snprintf(D.play_value,sizeof(D.play_value),"%s",id?id:"");D.play_pending=1;}
+void xe_detail_open(const XeMeta *m){int i; if(D.has_meta)dmeta_free(&D.meta);D.has_meta=dmeta_copy(&D.meta,m);D.expanded=0;D.play_pending=0;D.list_added=0;D.active_tab=0;D.season=1;D.ep_count=0;D.ep_focus=0;D.scroll=0;
+ if(D.has_meta){dset_image(&D.backdrop,&D.backdrop_url,D.meta.background?D.meta.background:D.meta.poster,1280,720);dset_image(&D.logo,&D.logo_url,D.meta.logo,600,240);}for(i=0;i<32;i++)D.season_ids[i]=xe_id_mix(xe_id("detail-season"),i);D.play_id=xe_id("detail-play");D.list_id=xe_id("detail-list");D.trailer_id=xe_id("detail-trailer");D.expand_id=xe_id("detail-expand");D.tab_ids[0]=xe_id("detail-episodes");D.tab_ids[1]=xe_id("detail-more");D.tab_ids[2]=xe_id("detail-trailers");for(i=0;i<D_MAX_EP;i++)D.ep_ids[i]=xe_id_mix(xe_id("detail-episode"),i);D.initialized=1;xe_ui_set_focus(D.play_id);}
+static void d_draw_episodes(float x,float y,float w,float h){int i;float cardw=dd(340),gap=dd(18),left=x;char label[256];if(D.ep_count==0){dtxt("Episodes will appear here when episode metadata is supplied.",x,y+dd(28),dd(15),D_MUTED);return;}
+ xe_r_push_clip((XeRect){x,y,w,h},dd(4));for(i=0;i<D.ep_count;i++){float cx=left+i*(cardw+gap)-D.scroll;if(cx+cardw<x||cx>x+w)continue;XeRect r={cx,y,cardw,h};int f=xe_ui_focusable(D.ep_ids[i],r);dbox(r,dd(10),(XeColor){0.13f,0.13f,0.16f,1});if(D.eps[i].thumb){XeImage *im=xe_img_get(D.eps[i].thumb,320,180);const XeTexture *t=xe_img_tex(im);if(t)xe_r_image(t,(XeRect){r.x,r.y,r.w,dd(146)},dd(10),xe_img_fade(im),0);}
+ snprintf(label,sizeof(label),"S%d E%d",D.eps[i].season,D.eps[i].episode);dtxt(label,cx+dd(12),y+dd(158),dd(13),D_MUTED);dtxt(D.eps[i].title?D.eps[i].title:"Episode",cx+dd(12),y+dd(181),dd(16),D_WHITE);dbox((XeRect){cx+dd(12),y+h-dd(12),cardw-dd(24),dd(3)},dd(2),(XeColor){0.3f,0.3f,0.32f,1});if(f)xe_r_border(r,dd(10),dd(2),D_RED);if(xe_ui_activated(D.ep_ids[i])){char id[512];snprintf(id,sizeof(id),"%s:S%d:E%d",D.meta.id?D.meta.id:"",D.eps[i].season,D.eps[i].episode);dmake_play(id,D.meta.type);}}
+ xe_r_pop_clip();}
+void xe_detail_frame(double dt,XeRect area){XeEvent ev[D_MAX_EVENTS];int n=0,i;float w=area.w,h=area.h,scale=1;D.dt=dt;D.density=1.0f;while(n<D_MAX_EVENTS&&xe_platform_poll(&ev[n]))n++;xe_ui_begin(dt,ev,n);xe_img_pump();xe_r_begin((int)w,(int)h);dbox((XeRect){0,0,w,h},0,D_BG);
+ if(!D.initialized||!D.has_meta){dtxt("No title selected",dd(64),dd(70),dd(28),D_WHITE);xe_ui_end();xe_r_end();return;}
+ if(D.backdrop){const XeTexture *t=xe_img_tex(D.backdrop);if(t)xe_r_image(t,(XeRect){0,0,w,h},0,xe_img_fade(D.backdrop),0);}
+ /* Layered left/bottom scrims approximate the cinema-gradient without a new shader API. */
+ for(i=0;i<8;i++){float a=0.76f*(1.0f-(float)i/9.0f);dbox((XeRect){w*(float)i/8.0f,0,w/8.0f+1,h},0,(XeColor){0.02f,0.02f,0.03f,a});}
+ dbox((XeRect){0,h*0.68f,w,h*0.32f},0,(XeColor){0.02f,0.02f,0.03f,0.66f});
+ /* Title and facts */
+ if(D.logo){const XeTexture *t=xe_img_tex(D.logo);if(t)xe_r_image(t,(XeRect){dd(64),dd(46),dd(380),dd(150)},0,xe_img_fade(D.logo),0);}else dtxt(D.meta.name?D.meta.name:"Untitled",dd(64),dd(88),dd(36),D_WHITE);
+ {char facts[512];int used=0;facts[0]=0;if(D.meta.release)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"%s",D.meta.release);if(D.meta.runtime&&used<(int)sizeof(facts)-8)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  %s",D.meta.runtime);if(D.meta.imdb_rating&&used<(int)sizeof(facts)-8)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  IMDb %s",D.meta.imdb_rating);for(i=0;i<D.meta.n_genres&&used<(int)sizeof(facts)-48;i++)used+=snprintf(facts+used,sizeof(facts)-(size_t)used,"  ·  %s",D.meta.genres[i]);dtxt(facts,dd(66),dd(218),dd(15),D_MUTED);}
+ if(D.meta.description){char desc[1024];snprintf(desc,sizeof(desc),"%s",D.meta.description);if(!D.expanded&&strlen(desc)>205){desc[200]=0;strcat(desc,"…");}dtxt(desc,dd(66),dd(252),dd(16),D_WHITE);if(strlen(D.meta.description)>205){if(dbutton(D.expand_id,(XeRect){dd(64),dd(322),dd(150),dd(38)},D.expanded?"Show less":"More details",0))D.expanded=!D.expanded;}}
+ if(dbutton(D.play_id,(XeRect){dd(64),dd(382),dd(230),dd(62)},"▶  Play / Resume",1))dmake_play(D.meta.id,D.meta.type);
+ if(dbutton(D.trailer_id,(XeRect){dd(310),dd(382),dd(150),dd(62)},"Trailer",0)){}if(dbutton(D.list_id,(XeRect){dd(474),dd(382),dd(100),dd(62)},D.list_added?"✓ Listed":"＋ List",0))D.list_added=!D.list_added;
+ /* Tabs and series episodes follow the reference detail layout. */
+ {const char *tabs[]={"Episodes","More Like This","Trailers & More"};float tx=dd(64);for(i=0;i<3;i++){XeRect r={tx,dd(492),dd(i==1?190:150),dd(44)};int f=xe_ui_focusable(D.tab_ids[i],r);if(f||D.active_tab==i)xe_r_border(r,dd(8),dd(2),D.active_tab==i?D_RED:D_WHITE);dtxt(tabs[i],r.x+dd(8),r.y+dd(14),dd(15),D_WHITE);if(xe_ui_activated(D.tab_ids[i]))D.active_tab=i;tx+=r.w+dd(18);}}
+ if(D.meta.type&&strcmp(D.meta.type,"movie")!=0){dtxt("Season",dd(64),dd(560),dd(16),D_WHITE);for(i=0;i<6;i++){char s[32];XeRect r={dd(140+i*72),dd(548),dd(60),dd(40)};snprintf(s,sizeof(s),"S%d",i+1);int f=xe_ui_focusable(D.season_ids[i],r);dbox(r,dd(8),D.season==i+1?D_RED:(XeColor){0.16f,0.16f,0.18f,1});if(f)xe_r_border(r,dd(8),dd(2),D_WHITE);dtxt(s,r.x+dd(18),r.y+dd(12),dd(14),D_WHITE);if(xe_ui_activated(D.season_ids[i]))D.season=i+1;}}
+ d_draw_episodes(dd(64),dd(610),w-dd(128),dd(235));xe_ui_end();xe_r_end();}
+int xe_detail_play(char *out_type,char *out_id,size_t cap){if(!D.play_pending)return 0;D.play_pending=0;if(out_type)snprintf(out_type,cap,"%s",D.play_type);if(out_id&&cap)snprintf(out_id,cap,"%s",D.play_value);return 1;}
+```
+
+### FILE: include/xe/search.h
+```c
+#ifndef XE_SEARCH_H
+#define XE_SEARCH_H
+#include "xe/render.h"
+#include "xe/data.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+void xe_search_frame(double dt, XeRect area);
+/* Returns 1 once when a result is selected; the caller owns heap fields in out. */
+int xe_search_opened(XeMeta *out);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/screens/search.c
+```c
+#include "xe/search.h"
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/text.h"
+#include "xe/images.h"
+#include "xe/ui.h"
+#include "xe/anim.h"
+#include "xe/data.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define S_BG ((XeColor){0.035f,0.035f,0.047f,1})
+#define S_WHITE ((XeColor){0.95f,0.95f,0.97f,1})
+#define S_MUTED ((XeColor){0.62f,0.63f,0.68f,1})
+#define S_RED ((XeColor){0.90f,0.035f,0.08f,1})
+#define S_MAX_EVENTS 96
+#define S_MAX_RESULTS 160
+#define S_MAX_RECENT 8
+#define S_QUERY_CAP 192
+
+typedef struct { XeMeta m; XeImage *image; } SResult;
+static struct {
+ int initialized, search_pending, result_ready, result_count, focus_result, recent_count;
+ char query[S_QUERY_CAP]; size_t query_len;
+ char recent[S_MAX_RECENT][S_QUERY_CAP];
+ SResult results[S_MAX_RESULTS]; XeMeta opened; int opened_valid;
+ XeId key_ids[40], recent_ids[S_MAX_RECENT], search_id, clear_id, result_ids[S_MAX_RESULTS];
+ float scroll,density;
+} S;
+static char *sdup(const char *s){size_t n;char *p;if(!s)return NULL;n=strlen(s)+1;p=(char*)malloc(n);if(p)memcpy(p,s,n);return p;}
+static void smeta_free(XeMeta *m){int i;if(!m)return;free(m->id);free(m->type);free(m->name);free(m->poster);free(m->background);free(m->logo);free(m->description);free(m->release);free(m->imdb_rating);free(m->runtime);for(i=0;i<m->n_genres;i++)free(m->genres[i]);free(m->genres);memset(m,0,sizeof(*m));}
+static int smeta_copy(XeMeta *d,const XeMeta *s){int i;memset(d,0,sizeof(*d));if(!s)return 0;
+#define SC(f) do{if(s->f&&!(d->f=sdup(s->f)))goto fail;}while(0)
+ SC(id);SC(type);SC(name);SC(poster);SC(background);SC(logo);SC(description);SC(release);SC(imdb_rating);SC(runtime);
+#undef SC
+ if(s->n_genres>0&&s->genres){d->genres=(char**)calloc((size_t)s->n_genres,sizeof(char*));if(!d->genres)goto fail;for(i=0;i<s->n_genres;i++){if(s->genres[i]&&!(d->genres[i]=sdup(s->genres[i])))goto fail;d->n_genres++;}}return 1;fail:smeta_free(d);return 0;}
+static float sd(float x){return x*(S.density>0?S.density:1.0f);}
+static void stxt(const char *t,float x,float y,float size,XeColor c){if(t&&*t)xe_text_draw(t,sd(x),sd(y),sd(size),c);}
+static void sbox(XeRect r,float radius,XeColor c){xe_r_rect(r,radius,c);}
+static int sbutton(XeId id,XeRect r,const char *label,int primary){int f=xe_ui_focusable(id,r),a=xe_ui_activated(id);sbox(r,sd(8),primary?S_RED:(XeColor){0.15f,0.15f,0.18f,1});if(f)xe_r_border(r,sd(8),sd(2),S_WHITE);stxt(label,r.x+sd(9),r.y+sd(11),sd(14),S_WHITE);return a;}
+static void srequest(void){if(!S.query_len)return;S.search_pending=1;S.result_ready=0;}
+static void sresults_cb(XeMeta *items,int n,void *u){int i;(void)u;for(i=0;i<S.result_count;i++)smeta_free(&S.results[i].m);S.result_count=0;if(n>S_MAX_RESULTS)n=S_MAX_RESULTS;for(i=0;i<n;i++){if(smeta_copy(&S.results[i].m,&items[i])){char full[2048];S.results[i].image=NULL;if(items[i].poster){if(strstr(items[i].poster,"http://")==items[i].poster||strstr(items[i].poster,"https://")==items[i].poster)snprintf(full,sizeof(full),"%s",items[i].poster);else snprintf(full,sizeof(full),"https://image.tmdb.org/t/p/w342%s",items[i].poster);S.results[i].image=xe_img_get(full,342,513);}S.result_ids[i]=xe_id_mix(xe_id("search-result"),i);S.result_count++;}}S.search_pending=0;S.result_ready=1;}
+static void srun_search(void){char q[S_QUERY_CAP];if(!S.query_len)return;snprintf(q,sizeof(q),"%s",S.query);if(S.recent_count<S_MAX_RECENT){int i;for(i=S.recent_count;i>0;i--)memcpy(S.recent[i],S.recent[i-1],S_QUERY_CAP);snprintf(S.recent[0],S_QUERY_CAP,"%s",q);S.recent_count++;}else{int i;for(i=S_MAX_RECENT-1;i>0;i--)memcpy(S.recent[i],S.recent[i-1],S_QUERY_CAP);snprintf(S.recent[0],S_QUERY_CAP,"%s",q);}xe_data_search(q,sresults_cb,NULL);S.search_pending=1;}
+static void sadd_char(char c){if(S.query_len+1<S_QUERY_CAP){S.query[S.query_len++]=c;S.query[S.query_len]=0;}}
+static void sdelete(void){if(S.query_len){S.query[--S.query_len]=0;}}
+static const char *KEYS[]={"1","2","3","4","5","6","7","8","9","0","q","w","e","r","t","y","u","i","o","p","a","s","d","f","g","h","j","k","l","z","x","c","v","b","n","m","Space","Delete","Clear","Search"};
+void xe_search_frame(double dt,XeRect area){XeEvent ev[S_MAX_EVENTS];int n=0,i;float w=area.w,h=area.h;S.density=1.0f;if(!S.initialized){for(i=0;i<40;i++)S.key_ids[i]=xe_id_mix(xe_id("search-key"),i);for(i=0;i<S_MAX_RECENT;i++)S.recent_ids[i]=xe_id_mix(xe_id("search-recent"),i);S.search_id=xe_id("search-submit");S.clear_id=xe_id("search-clear");S.initialized=1;xe_ui_set_focus(S.key_ids[0]);}while(n<S_MAX_EVENTS&&xe_platform_poll(&ev[n]))n++;xe_ui_begin(dt,ev,n);xe_img_pump();xe_data_pump();
+ /* Windows physical keyboard: text input goes directly into the query. Event field names follow P1 platform.h. */
+ for(i=0;i<n;i++)if(ev[i].type==XE_EV_KEY_DOWN){if(ev[i].key==XE_KEY_BACKSPACE)sdelete();else if(ev[i].key==XE_KEY_ENTER)srun_search();}
+ xe_r_begin((int)w,(int)h);sbox((XeRect){0,0,w,h},0,S_BG);stxt("Search",sd(54),sd(48),sd(30),S_WHITE);
+ sbox((XeRect){sd(54),sd(70),w-sd(108),sd(54)},sd(8),(XeColor){0.12f,0.12f,0.15f,1});stxt(S.query,sd(70),sd(88),sd(20),S_WHITE);if(!S.query_len)stxt("Search movies and series…",sd(70),sd(88),sd(18),S_MUTED);
+ /* Remote keyboard grid: typing is local; only the Search key triggers a request. */
+ for(i=0;i<40;i++){int col=i%10,row=i/10;float kw=sd(52),gap=sd(6),x=sd(54)+col*(kw+gap),y=sd(142)+row*sd(45);XeRect r={x,y,kw,sd(38)};int f=xe_ui_focusable(S.key_ids[i],r);sbox(r,sd(6),(XeColor){0.14f,0.14f,0.17f,1});if(f)xe_r_border(r,sd(6),sd(2),S_WHITE);const char *label=KEYS[i];if(i==36)label="Space";if(i==37)label="Del";if(i==38)label="Clear";if(i==39)label="Search";stxt(label,x+sd(6),y+sd(11),sd(i>=36?11:14),S_WHITE);if(xe_ui_activated(S.key_ids[i])){if(i<36)sadd_char(KEYS[i][0]);else if(i==36)sadd_char(' ');else if(i==37)sdelete();else if(i==38){S.query_len=0;S.query[0]=0;}else srun_search();}}
+ stxt("Recent",sd(54),sd(345),sd(16),S_MUTED);for(i=0;i<S.recent_count;i++){XeRect r={sd(54+i*150),sd(362),sd(138),sd(34)};int f=xe_ui_focusable(S.recent_ids[i],r);sbox(r,sd(16),(XeColor){0.12f,0.12f,0.15f,1});if(f)xe_r_border(r,sd(16),sd(2),S_RED);stxt(S.recent[i],r.x+sd(10),r.y+sd(10),sd(12),S_WHITE);if(xe_ui_activated(S.recent_ids[i])){snprintf(S.query,sizeof(S.query),"%s",S.recent[i]);S.query_len=strlen(S.query);srun_search();}}
+ stxt(S.search_pending?"Searching…":(S.result_ready?"Results":"Press Search to find titles"),sd(54),sd(424),sd(17),S_MUTED);
+ {int cols=8;float cw=sd(125),ch=sd(188),gap=sd(14),y0=sd(452);for(i=0;i<S.result_count;i++){int row=i/cols,col=i%cols;float x=sd(54)+col*(cw+gap),y=y0+row*(ch+sd(22))-S.scroll;if(y+ch<y0||y>h)continue;XeRect r={x,y,cw,ch};int f=xe_ui_focusable(S.result_ids[i],r);sbox(r,sd(8),(XeColor){0.12f,0.12f,0.15f,1});if(S.results[i].image){const XeTexture *t=xe_img_tex(S.results[i].image);if(t)xe_r_image(t,r,sd(8),xe_img_fade(S.results[i].image),0);}if(f)xe_r_border(r,sd(8),sd(2),S_RED);stxt(S.results[i].m.name?S.results[i].m.name:"Untitled",x,y+ch+sd(4),sd(12),S_WHITE);if(xe_ui_activated(S.result_ids[i])){if(S.opened_valid)smeta_free(&S.opened);S.opened_valid=smeta_copy(&S.opened,&S.results[i].m);}}}
+ xe_ui_end();xe_r_end();}
+int xe_search_opened(XeMeta *out){if(!S.opened_valid)return 0;if(out){*out=S.opened;memset(&S.opened,0,sizeof(S.opened));}else smeta_free(&S.opened);S.opened_valid=0;return 1;}
+```
+
+### FILE: tests/p10_detail_search_test.c
+```c
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/net.h"
+#include "xe/jobs.h"
+#include "xe/data.h"
+#include "xe/detail.h"
+#include "xe/search.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int page_search=0;
+static XeMeta demo;
+static char *dup0(const char *s){size_t n=strlen(s)+1;char *p=(char*)malloc(n);if(p)memcpy(p,s,n);return p;}
+int xe_app_init(void){xe_net_init();xe_jobs_init(3);{const char *addons[]={"https://v3-cinemeta.strem.io/manifest.json"};xe_data_init(addons,1,NULL);}memset(&demo,0,sizeof(demo));demo.id=dup0("tt0111161");demo.type=dup0("movie");demo.name=dup0("The Shawshank Redemption");demo.background=dup0("/kXfqcdQKsToO0OUXHcrrNCHDBzO.jpg");demo.poster=dup0("/9O1Iy9od7zoBr2WymuL9d7ZqW2g.jpg");demo.release=dup0("1994");demo.imdb_rating=dup0("9.3");demo.description=dup0("Two imprisoned men bond over a number of years, finding solace and eventual redemption through acts of common decency.");xe_detail_open(&demo);xe_platform_set_wants_frames(1);return 1;}
+void xe_app_frame(double dt){int w=1280,h=720;float density=1;XeMeta opened;XeEvent ev;while(xe_platform_poll(&ev)){if(ev.type==XE_EV_KEY_DOWN&&ev.key==XE_KEY_ESCAPE)page_search=!page_search;if(ev.type==XE_EV_KEY_DOWN&&ev.key==XE_KEY_F1)page_search=!page_search;}xe_platform_size(&w,&h,&density);if(page_search){xe_search_frame(dt,(XeRect){0,0,(float)w,(float)h});if(xe_search_opened(&opened)){printf("Selected: %s\n",opened.name?opened.name:"");xe_data_free_meta(&opened);}}else{char type[32],id[512];xe_detail_frame(dt,(XeRect){0,0,(float)w,(float)h});if(xe_detail_play(type,id,sizeof(id)))printf("Play: %s %s\n",type,id);}}
+void xe_app_shutdown(void){xe_data_shutdown();xe_net_shutdown();xe_jobs_shutdown();}
+```
+
+### FILE: CMakeLists_P10_integration.txt
+```cmake
+# Merge into the existing build after P1-P9 setup.
+target_sources(xe PRIVATE src/screens/detail.c src/screens/search.c)
+target_include_directories(xe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+option(XE_BUILD_P10_TEST "Build P10 detail/search smoke test" OFF)
+if(XE_BUILD_P10_TEST AND WIN32 AND XE_BUILD_WINDOWS_HOST)
+  target_sources(xe_win PRIVATE tests/p10_detail_search_test.c)
+endif()
+```
+
+### FILE: README_P10.md
+```text
+P10 integration
+===============
+1. Add include/xe/detail.h, include/xe/search.h, src/screens/detail.c, and src/screens/search.c.
+2. Merge CMakeLists_P10_integration.txt into the existing root CMakeLists.txt.
+3. Initialize P1 platform, P3 renderer, P4 text, P5 jobs/images, P6 net, and P8 data before showing either screen.
+4. Call xe_detail_open(&meta) after choosing a title. Each frame call xe_detail_frame(dt, area). Poll xe_detail_play(type, id, sizeof(id)); episode ids use :S<season>:E<episode>.
+5. Call xe_search_frame(dt, area) while search is active; poll xe_search_opened(&meta) after each frame. The returned metadata's heap fields transfer to the caller; for a stack XeMeta, free fields individually or use a project-owned helper that doesn't free the struct.
+6. Escape/F1 switch pages in the smoke host. Enter triggers Search; arrow keys navigate the UI. Physical keyboard text insertion needs a text-input event from P1 if available; the portable draft currently handles backspace/Enter and remote keyboard controls. Extend the event branch to append printable characters using the exact P1 text event contract.
+
+Limitations to resolve during integration:
+- This bundle uses the P9 reference P3/P4/P5/P7/P8 APIs repeated below; verify exact signatures against your actual files.
+- Episode metadata has a local display structure but no public setter/loader yet; P8 currently returns episode arrays through xe_data_meta callbacks. Wire that callback into the detail page to populate episode cards.
+- Trailer playback, persistent list/watch progress, and provider-specific resume timestamps require later player/profile integration.
+- UI layout is optimized for 1920x1080 and 1280x720; density is currently 1.0 because the supplied APIs do not expose a guaranteed logical-DP transform contract.
+- Image cache handles are held for displayed results; release them when replacing/clearing the result list in a production lifecycle.
+```
+
+============================================================
+REFERENCE HEADERS — append only if these match your existing P1–P9 tree
+============================================================
+
+### FILE: include/xe/render.h
+```c
+#ifndef XE_RENDER_H
+#define XE_RENDER_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float x,y,w,h; } XeRect;
+typedef struct { float r,g,b,a; } XeColor;
+typedef struct XeTexture XeTexture;
+void xe_r_begin(int width,int height);
+void xe_r_end(void);
+void xe_r_rect(XeRect r,float radius,XeColor color);
+void xe_r_border(XeRect r,float radius,float thickness,XeColor color);
+void xe_r_image(const XeTexture *texture,XeRect r,float radius,float alpha,int flags);
+void xe_r_push_clip(XeRect r,float radius);
+void xe_r_pop_clip(void);
+XeTexture *xe_tex_create(int width,int height,const unsigned char *rgba);
+void xe_tex_destroy(XeTexture *texture);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/text.h
+```c
+#ifndef XE_TEXT_H
+#define XE_TEXT_H
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+int xe_text_init(const char *font_path);
+void xe_text_shutdown(void);
+void xe_text_draw(const char *utf8,float x,float y,float size,XeColor color);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/images.h
+```c
+#ifndef XE_IMAGES_H
+#define XE_IMAGES_H
+#include <stddef.h>
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct XeImage XeImage;
+XeImage *xe_img_get(const char *url,int want_w,int want_h);
+const XeTexture *xe_img_tex(XeImage *img);
+float xe_img_fade(XeImage *img);
+int xe_img_failed(XeImage *img);
+void xe_img_release(XeImage *img);
+void xe_img_pump(void);
+void xe_img_set_budget(size_t gpu_bytes,size_t disk_bytes);
+size_t xe_img_gpu_bytes(void);
+size_t xe_img_disk_bytes(void);
+unsigned long xe_img_cache_hits(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/anim.h
+```c
+#ifndef XE_ANIM_H
+#define XE_ANIM_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float value,velocity,target,stiffness,damping; } XeSpring;
+typedef struct { double start,duration; float from,to; int active; } XeTween;
+void xe_spring_init(XeSpring *s,float v,float stiffness,float damping);
+void xe_spring_step(XeSpring *s,double dt);
+int xe_spring_resting(const XeSpring *s);
+float xe_ease_out_cubic(float t);
+float xe_ease_in_out(float t);
+float xe_tween_value(XeTween *t,double now);
+int xe_anim_any_running(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/ui.h
+```c
+#ifndef XE_UI_H
+#define XE_UI_H
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/anim.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef unsigned long long XeId;
+typedef struct { XeId id; int count; float item_w,gap,offset; XeSpring spring; } XeRow;
+typedef struct { XeId id; int count; float item_h,gap,offset; XeSpring spring; } XeColumn;
+XeId xe_id(const char *s);
+XeId xe_id_mix(XeId a,long long n);
+void xe_ui_begin(double dt,const XeEvent *events,int n);
+void xe_ui_end(void);
+int xe_ui_focusable(XeId id,XeRect r);
+int xe_ui_activated(XeId id);
+void xe_ui_set_focus(XeId id);
+XeId xe_ui_focus(void);
+float xe_ui_focus_anim(XeId id);
+void xe_row_scroll_to(XeRow *row,int index,float view_w);
+void xe_column_scroll_to(XeColumn *column,int index,float view_h);
+void xe_ui_set_scroll_view(XeId id,XeRect viewport,float *offset,float content_extent,int vertical);
+float xe_ui_pointer_scroll_delta(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/data.h
+```c
+#ifndef XE_DATA_H
+#define XE_DATA_H
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { char *id,*type,*name,*poster,*background,*logo,*description; char *release,*imdb_rating,*runtime; char **genres; int n_genres; } XeMeta;
+typedef struct { char *title; XeMeta *items; int n; } XeShelf;
+typedef struct { char *addon,*url,*name,*title,*filename; long long size; char **headers; int n_headers; int height; } XeStream;
+typedef struct { char *id,*title,*thumb; int season,episode; } XeEpisode;
+void xe_data_init(const char *const *addon_manifest_urls,int n,const char *tmdb_key);
+void xe_data_shutdown(void);
+void xe_data_pump(void);
+void xe_data_home(void (*cb)(XeShelf *shelves,int n,void *u),void *u);
+void xe_data_meta(const char *type,const char *id,void (*cb)(XeMeta *m,XeEpisode *eps,int n_eps,void *u),void *u);
+void xe_data_search(const char *q,void (*cb)(XeMeta *res,int n,void *u),void *u);
+void xe_data_streams(const char *type,const char *id,void (*cb)(XeStream *s,int n,int finished,void *u),void *u);
+void xe_data_free_meta(XeMeta *m);
+void xe_data_free_metas(XeMeta *items,int n);
+void xe_data_free_shelves(XeShelf *shelves,int n);
+void xe_data_free_streams(XeStream *streams,int n);
+void xe_data_free_episodes(XeEpisode *eps,int n);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### SUMMARY
+```json
+{
+  "part": "P10",
+  "files": ["include/xe/detail.h", "src/screens/detail.c", "include/xe/search.h", "src/screens/search.c", "tests/p10_detail_search_test.c", "CMakeLists_P10_integration.txt", "README_P10.md", "reference headers: render.h, text.h, images.h, ui.h, anim.h, data.h"],
+  "public_api": ["void xe_detail_open(const XeMeta *m)", "void xe_detail_frame(double dt, XeRect area)", "int xe_detail_play(char *out_type, char *out_id, size_t cap)", "void xe_search_frame(double dt, XeRect area)", "int xe_search_opened(XeMeta *out)"],
+  "depends_on": ["P1 platform", "P3 render", "P4 text", "P5 images/jobs", "P6 net", "P7 UI/animation", "P8 data"],
+  "assumptions": ["The P9 reference headers match the user's existing P1-P9 tree; confirm before merging.", "Screens own copies of metadata passed to xe_detail_open and returned from xe_search_opened.", "Data callbacks run through xe_data_pump on the render/main thread.", "A renderer with image alpha and rounded rectangles is available."],
+  "not_done": ["Populate episode cards from xe_data_meta callback in a project-specific bridge.", "Implement actual trailer playback, persistent watchlist and resume progress.", "Append printable physical keyboard characters using the exact P1 text-input event contract.", "Build/runtime validation against the user's repository has not been performed."],
+  "how_to_test": "Merge the CMake additions and build the Windows host with XE_BUILD_P10_TEST=ON. The test opens a fixed title; press Escape or F1 to switch to search, navigate the on-screen keyboard, press Search, and activate a result. On the detail page, focus Play/Resume and press Enter to verify xe_detail_play returns the selected type/id."
+}
+```

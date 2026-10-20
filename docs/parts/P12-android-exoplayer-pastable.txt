@@ -1,0 +1,403 @@
+XE P12 — ANDROID EXOPLAYER / MEDIA3 BACKEND
+===========================================
+
+Integration bundle for P2 Android host + P11 shared player API and overlay. Merge these files into the existing project; do not replace the root Gradle/CMake files. This is an integration scaffold, not a verified build. It assumes P2's Android host has package name `com.streamx.xe` and a GLSurfaceView-derived `XeView`; rename package/class references to match your actual P2 files.
+
+Architecture note: SurfaceView is placed behind the transparent GL view. The GL view must use an alpha-capable EGL config and clear with alpha 0 in the video viewport; otherwise Android will composite an opaque GL surface over the video. Keep player state updates on the main thread, and push snapshots to native every 250 ms. Never poll JNI getters every render frame.
+
+### FILE: app/build.gradle.kts (MERGE DEPENDENCIES ONLY)
+```kotlin
+dependencies {
+    val media3 = "1.7.1"
+    implementation("androidx.media3:media3-exoplayer:$media3")
+    implementation("androidx.media3:media3-ui:$media3")
+    implementation("androidx.media3:media3-exoplayer-hls:$media3")
+    implementation("androidx.media3:media3-exoplayer-dash:$media3")
+    implementation("androidx.media3:media3-datasource-okhttp:$media3")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+}
+```
+
+### FILE: app/src/main/java/com/streamx/xe/XePlayer.kt
+```kotlin
+package com.streamx.xe
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.view.SurfaceView
+import android.view.View
+import android.widget.FrameLayout
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.Format
+import androidx.media3.common.text.Cue
+import androidx.media3.common.text.CueGroup
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.ui.CaptionStyleCompat
+import androidx.media3.ui.PlayerView
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+
+/** Android playback host. The GL view must be an overlay above this SurfaceView. */
+class XePlayer(
+    private val context: Context,
+    private val root: FrameLayout,
+    private val glView: View
+) {
+    private val main = Handler(Looper.getMainLooper())
+    private var player: ExoPlayer? = null
+    private var surface: SurfaceView? = null
+    private var started = false
+    private var latestPos = 0.0
+    private var latestDur = 0.0
+    private var latestBuffering = 0
+    private var subtitleText = ""
+    private var tracks = Array(3) { emptyList<String>() }
+    private var trackGroups: androidx.media3.common.Tracks? = null
+    private var nativeHandle: Long = 0
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            val p = player
+            if (p != null) {
+                latestPos = p.currentPosition.coerceAtLeast(0L) / 1000.0
+                latestDur = if (p.duration == C.TIME_UNSET) 0.0 else p.duration.coerceAtLeast(0L) / 1000.0
+                latestBuffering = if (p.playbackState == Player.STATE_BUFFERING) 1 else 0
+                collectTracks(p)
+                nativePushSnapshot(nativeHandle, latestPos, latestDur, latestBuffering, subtitleText)
+            }
+            main.postDelayed(this, 250L)
+        }
+    }
+
+    fun attachNative(handle: Long) { nativeHandle = handle }
+
+    fun open(url: String, headerPairs: Array<String>, startSec: Double) {
+        check(Looper.myLooper() == Looper.getMainLooper()) { "XePlayer.open must run on main thread" }
+        closeInternal(false)
+        val headers = linkedMapOf<String, String>()
+        var i = 0
+        while (i + 1 < headerPairs.size) { headers[headerPairs[i]] = headerPairs[i + 1]; i += 2 }
+        val client = OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true).build()
+        val httpFactory = OkHttpDataSource.Factory(client).setUserAgent("StreamX/XE")
+            .setDefaultRequestProperties(headers)
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(30_000, 60_000, 1_500, 5_000)
+            .setTargetBufferBytes(DefaultLoadControl.DEFAULT_TARGET_BUFFER_BYTES)
+            .setPrioritizeTimeOverSizeThresholds(true).build()
+        val selector = DefaultTrackSelector(context)
+        val exo = ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(context).setDataSourceFactory(httpFactory))
+            .setLoadControl(loadControl).setTrackSelector(selector).build()
+        val sv = SurfaceView(context)
+        sv.layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        // SurfaceView stays behind GL. Add it first, then make GL a media overlay.
+        root.addView(sv, 0)
+        if (glView is android.opengl.GLSurfaceView) {
+            glView.setZOrderMediaOverlay(true)
+            glView.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        }
+        val view = PlayerView(context).apply {
+            player = exo
+            useController = false
+            // PlayerView isn't added: ExoPlayer renders directly to SurfaceView below GL.
+        }
+        exo.setVideoSurfaceView(sv)
+        exo.addListener(object : Player.Listener {
+            override fun onTracksChanged(tracksNow: androidx.media3.common.Tracks) { trackGroups = tracksNow; collectTracks(exo) }
+            override fun onCues(cueGroup: CueGroup) {
+                subtitleText = cueGroup.cues.joinToString("\n") { it.text?.toString().orEmpty() }.trim()
+                nativePushSnapshot(nativeHandle, latestPos, latestDur, latestBuffering, subtitleText)
+            }
+        })
+        surface = sv; player = exo
+        exo.setMediaItem(MediaItem.fromUri(url))
+        exo.prepare()
+        if (startSec > 0.0) exo.seekTo((startSec * 1000.0).toLong())
+        exo.playWhenReady = true
+        started = true
+        main.removeCallbacks(ticker); main.post(ticker)
+    }
+
+    private fun collectTracks(p: ExoPlayer) {
+        val audio = mutableListOf<String>(); val subs = mutableListOf<String>(); val video = mutableListOf<String>()
+        for (group in p.currentTracks.groups) {
+            val type = group.type
+            for (i in 0 until group.length) {
+                val f: Format = group.getTrackFormat(i)
+                val label = f.label ?: listOfNotNull(f.language, f.sampleMimeType, f.height.takeIf { it > 0 }?.let { "${it}p" }).joinToString(" · ").ifBlank { "Track ${i + 1}" }
+                val selected = if (group.isTrackSelected(i)) " ✓" else ""
+                when (type) { C.TRACK_TYPE_AUDIO -> audio += label + selected; C.TRACK_TYPE_TEXT -> subs += label + selected; C.TRACK_TYPE_VIDEO -> video += label + selected }
+            }
+        }
+        tracks = arrayOf(audio, subs, video)
+    }
+
+    fun toggle() { player?.let { if (it.isPlaying) it.pause() else it.play() } }
+    fun seek(seconds: Double) { val p = player ?: return; p.seekTo((p.currentPosition + seconds * 1000.0).toLong().coerceAtLeast(0L)) }
+    fun selectTrack(kind: Int, index: Int) {
+        val p = player ?: return
+        val type = when (kind) { 0 -> C.TRACK_TYPE_AUDIO; 1 -> C.TRACK_TYPE_TEXT; else -> C.TRACK_TYPE_VIDEO }
+        val groups = p.currentTracks.groups.filter { it.type == type }
+        val flat = groups.flatMap { g -> (0 until g.length).map { g to it } }
+        val choice = flat.getOrNull(index) ?: return
+        val overrides = androidx.media3.common.TrackSelectionOverride(choice.first.mediaTrackGroup, listOf(choice.second))
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().clearOverridesOfType(type).addOverride(overrides).build()
+    }
+    fun trackNames(kind: Int): List<String> = tracks.getOrElse(kind) { emptyList() }
+    fun position() = latestPos
+    fun duration() = latestDur
+    fun buffering() = latestBuffering
+
+    private fun closeInternal(stopTicker: Boolean) {
+        if (stopTicker) main.removeCallbacks(ticker)
+        player?.release(); player = null
+        surface?.let { root.removeView(it) }; surface = null
+        started = false; subtitleText = ""; tracks = Array(3) { emptyList() }
+        nativePushSnapshot(nativeHandle, 0.0, 0.0, 0, "")
+    }
+    fun close() { check(Looper.myLooper() == Looper.getMainLooper()); closeInternal(true) }
+    private external fun nativePushSnapshot(handle: Long, pos: Double, dur: Double, buffering: Int, subtitle: String)
+    private external fun nativePushTracks(handle: Long, kind: Int, names: Array<String>)
+    companion object { init { System.loadLibrary("xe") } }
+}
+```
+
+### FILE: app/src/main/java/com/streamx/xe/PlayerBridge.kt
+```kotlin
+package com.streamx.xe
+
+import android.app.Activity
+import android.widget.FrameLayout
+import android.view.View
+
+/** Instantiate from P2 Activity after the root FrameLayout and XeView exist. */
+object PlayerBridge {
+    @Volatile private var instance: XePlayer? = null
+    @JvmStatic fun install(activity: Activity, root: FrameLayout, glView: View, nativeHandle: Long) {
+        activity.runOnUiThread {
+            instance?.close()
+            instance = XePlayer(activity, root, glView).also { it.attachNative(nativeHandle) }
+        }
+    }
+    @JvmStatic fun open(url: String, headers: Array<String>, startSec: Double) = instance?.open(url, headers, startSec)
+    @JvmStatic fun toggle() = instance?.toggle()
+    @JvmStatic fun seek(seconds: Double) = instance?.seek(seconds)
+    @JvmStatic fun close() = instance?.close()
+    @JvmStatic fun tracks(kind: Int): Array<String> = instance?.trackNames(kind)?.toTypedArray() ?: emptyArray()
+    @JvmStatic fun select(kind: Int, index: Int) = instance?.selectTrack(kind, index)
+}
+```
+
+### FILE: jni/player_android.c
+```c
+#include "player.h"
+#include "xe/render.h"
+#include "xe/text.h"
+#include "xe/ui.h"
+#include <jni.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Snapshot values are pushed from Kotlin every 250 ms. Reads on render thread
+   only copy this small mutex-protected state; no JNI calls happen per frame. */
+typedef struct { pthread_mutex_t mu; double pos,dur; int buffering; char *subtitle; char **tracks[3]; int ntracks[3]; } AndroidPlayerState;
+static AndroidPlayerState A = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static JavaVM *g_vm;
+static jobject g_bridge;
+static jmethodID m_open,m_toggle,m_seek,m_close,m_tracks,m_select;
+static char *dup_utf8(const char *s){if(!s)return NULL;size_t n=strlen(s)+1;char *p=malloc(n);if(p)memcpy(p,s,n);return p;}
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved){(void)reserved;g_vm=vm;return JNI_VERSION_1_6;}
+/* Host calls this once after PlayerBridge.install; production P2 can store the
+   class/method IDs during JNI_OnLoad or pass a global bridge class explicitly. */
+JNIEXPORT void JNICALL Java_com_streamx_xe_XePlayer_nativePushSnapshot(JNIEnv *env,jobject self,jlong handle,jdouble pos,jdouble dur,jint buffering,jstring subtitle){
+ (void)self;(void)handle;const char *s=subtitle?(*env)->GetStringUTFChars(env,subtitle,NULL):NULL;char *copy=dup_utf8(s?s:"");if(s)(*env)->ReleaseStringUTFChars(env,subtitle,s);
+ pthread_mutex_lock(&A.mu);A.pos=pos;A.dur=dur;A.buffering=buffering;free(A.subtitle);A.subtitle=copy;pthread_mutex_unlock(&A.mu);
+}
+JNIEXPORT void JNICALL Java_com_streamx_xe_XePlayer_nativePushTracks(JNIEnv *env,jobject self,jlong handle,jint kind,jobjectArray names){
+ (void)self;(void)handle;if(kind<0||kind>2)return;jsize n=(*env)->GetArrayLength(env,names);char **arr=calloc((size_t)n,sizeof(char*));if(!arr&&n)return;
+ for(jsize i=0;i<n;i++){jstring j=(jstring)(*env)->GetObjectArrayElement(env,names,i);const char *s=(*env)->GetStringUTFChars(env,j,NULL);arr[i]=dup_utf8(s?s:"");if(s)(*env)->ReleaseStringUTFChars(env,j,s);(*env)->DeleteLocalRef(env,j);}
+ pthread_mutex_lock(&A.mu);for(int i=0;i<A.ntracks[kind];i++)free(A.tracks[kind][i]);free(A.tracks[kind]);A.tracks[kind]=arr;A.ntracks[kind]=(int)n;pthread_mutex_unlock(&A.mu);
+}
+void xe_player_open(const char *url,const char *const *headers,double start_sec){
+ /* P2 should expose a JNI helper to call PlayerBridge.open(String,Array<String>,double).
+    Keep this API stub fail-closed until bridge class/method IDs are registered. */
+ (void)url;(void)headers;(void)start_sec;
+}
+void xe_player_toggle(void) { /* invoke PlayerBridge.toggle on Android main thread */ }
+void xe_player_seek(double sec) { (void)sec; /* invoke PlayerBridge.seek on Android main thread */ }
+void xe_player_close(void) { /* invoke PlayerBridge.close on Android main thread */ }
+double xe_player_pos(void){pthread_mutex_lock(&A.mu);double v=A.pos;pthread_mutex_unlock(&A.mu);return v;}
+double xe_player_dur(void){pthread_mutex_lock(&A.mu);double v=A.dur;pthread_mutex_unlock(&A.mu);return v;}
+int xe_player_buffering(void){pthread_mutex_lock(&A.mu);int v=A.buffering;pthread_mutex_unlock(&A.mu);return v;}
+int xe_player_tracks(int kind,char names[][64],int max){if(kind<0||kind>2||max<=0)return 0;pthread_mutex_lock(&A.mu);int n=A.ntracks[kind]<max?A.ntracks[kind]:max;for(int i=0;i<n;i++){snprintf(names[i],64,"%s",A.tracks[kind][i]?A.tracks[kind][i]:"");}pthread_mutex_unlock(&A.mu);return n;}
+void xe_player_select(int kind,int index){(void)kind;(void)index;/* dispatch to PlayerBridge.select on UI thread */}
+void xe_player_frame(double dt,XeRect area){(void)dt;(void)area;/* call platform-independent P11 overlay inside host's single GL pass */}
+```
+
+### FILE: app/src/main/java/com/streamx/xe/PlayerDemoActivity.kt
+```kotlin
+package com.streamx.xe
+
+import android.os.Bundle
+import android.view.View
+import android.widget.FrameLayout
+import androidx.appcompat.app.AppCompatActivity
+
+/** Demo scaffold: replace XeView construction with the exact P2 host class. */
+class PlayerDemoActivity : AppCompatActivity() {
+    private lateinit var root: FrameLayout
+    private lateinit var gl: View
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        root = FrameLayout(this)
+        gl = XeView(this) // P2 class; ensure EGL config has alpha and clear alpha=0 over video
+        root.addView(gl, FrameLayout.LayoutParams(-1, -1))
+        setContentView(root)
+        PlayerBridge.install(this, root, gl, 0L)
+        gl.post {
+            PlayerBridge.open("https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", emptyArray(), 0.0)
+        }
+    }
+    override fun onDestroy() { PlayerBridge.close(); super.onDestroy() }
+}
+```
+
+### FILE: CMakeLists_P12_integration.txt
+```text
+Add jni/player_android.c to the Android `xe` native target only (not the Windows target).
+Link Android log and GLESv2 as already configured by P2/P3. Ensure the Android shared library is named `xe`.
+Add the Kotlin files under the same package or update JNI-mangled function names accordingly.
+Merge Media3/OkHttp dependencies into app/build.gradle.kts; do not replace the existing Android Gradle configuration.
+```
+
+### FILE: README_P12.md
+```text
+1. Confirm P2 package name and XeView class; adjust package/class names in the two Kotlin files.
+2. Ensure GLSurfaceView requests an EGL config with 8-bit RGBA and clears with alpha 0; setZOrderMediaOverlay(true).
+3. Keep the SurfaceView below GL. The GL UI must draw transparent pixels over the video area.
+4. Add Media3 1.7.1 and OkHttp dependencies. Test HLS first; Media3's HLS/DASH/progressive sources are selected by DefaultMediaSourceFactory.
+5. Integrate the P11 overlay once into the host render pass. It currently polls events itself; do not also poll the same events elsewhere.
+6. IMPORTANT: `xe_player_open/toggle/seek/close/select` in the C file are deliberately stubs. Complete JNI dispatch using a global class/method reference and `Activity.runOnUiThread` before expecting playback controls from C to work. Kotlin playback itself can be tested by calling PlayerBridge.open directly.
+7. Add nativePushTracks invocation in collectTracks if C needs the pushed list; avoid repeated allocations by comparing track lists before pushing.
+8. Subtitle cues are stored in the native snapshot; P11 overlay must draw this subtitle string above the controls. The current P11 overlay does not yet expose a subtitle drawing hook.
+9. This bundle has not been compiled or run against your exact P2 host. Treat it as an implementation scaffold, not a ready-to-ship player.
+```
+
+### SUMMARY
+```json
+{
+  "part": "P12",
+  "files": ["app/build.gradle.kts (dependency merge)", "app/src/main/java/com/streamx/xe/XePlayer.kt", "app/src/main/java/com/streamx/xe/PlayerBridge.kt", "jni/player_android.c", "app/src/main/java/com/streamx/xe/PlayerDemoActivity.kt", "CMakeLists_P12_integration.txt", "README_P12.md", "src/player/player.h (P11 repeated below)", "src/player/overlay.c (P11 repeated below)", "P2 host reference notes (below)"],
+  "public_api": ["xe_player_open", "xe_player_toggle", "xe_player_seek", "xe_player_close", "xe_player_pos", "xe_player_dur", "xe_player_buffering", "xe_player_tracks", "xe_player_select", "xe_player_frame"],
+  "depends_on": ["P1 platform", "P2 Android host", "P3 GL renderer", "P4 text", "P7 UI", "P11 player API/overlay", "Media3 1.7.1", "OkHttp"],
+  "assumptions": ["P2 has an Activity, root FrameLayout and XeView/GLSurfaceView host; package/class names may need adjustment.", "SurfaceView is behind a transparent GL overlay and the GL EGL config supports alpha.", "Kotlin owns ExoPlayer and pushes position/duration/buffering every 250 ms."],
+  "not_done": ["JNI command dispatch stubs", "Native subtitle overlay hook", "Native track-list push call", "Compile/runtime verification against exact P2 files", "Low-memory device tuning based on actual memory class"],
+  "how_to_test": "Merge dependencies and Kotlin sources, adapt XeView to P2, launch PlayerDemoActivity, and confirm the HLS video appears beneath transparent GL. Then complete JNI dispatch and verify C API pause/seek/tracks and subtitle rendering."
+}
+```
+
+============================================================
+P11 SHARED FILES — requested repeat at the end
+============================================================
+
+### FILE: src/player/player.h
+```c
+#ifndef XE_PLAYER_H
+#define XE_PLAYER_H
+#include <stddef.h>
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+void xe_player_open(const char *url, const char *const *headers, double start_sec);
+void xe_player_toggle(void);
+void xe_player_seek(double sec);
+void xe_player_close(void);
+double xe_player_pos(void);
+double xe_player_dur(void);
+int xe_player_buffering(void);
+int xe_player_tracks(int kind, char names[][64], int max);
+void xe_player_select(int kind, int index);
+void xe_player_frame(double dt, XeRect area);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/player/overlay.c (P11 copy; adapt event ownership to P2 host)
+```c
+#include "player.h"
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/text.h"
+#include "xe/ui.h"
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#define P_RED ((XeColor){0.90f,0.035f,0.08f,1})
+#define P_WHITE ((XeColor){0.95f,0.95f,0.97f,1})
+#define P_MUTED ((XeColor){0.63f,0.64f,0.69f,1})
+static struct {double idle;int visible,paused,menu;XeId buttons[5];} O;
+static void txt(const char *s,float x,float y,float size,XeColor c){xe_text_draw(s,x,y,size,c);}
+static void fmt_time(double v,char *out,size_t cap){if(v<0)v=0;int h=(int)(v/3600),m=(int)(v/60)%60,s=(int)v%60;if(h)snprintf(out,cap,"%d:%02d:%02d",h,m,s);else snprintf(out,cap,"%02d:%02d",m,s);}
+static void button(XeId id,XeRect r,const char *s){int f=xe_ui_focusable(id,r);xe_r_rect(r,10,f?(XeColor){0.28f,0.28f,0.31f,0.98f}:(XeColor){0.10f,0.10f,0.13f,0.93f});if(f)xe_r_border(r,10,2,P_WHITE);txt(s,r.x+12,r.y+r.h*0.5f-8,16,P_WHITE);}
+void xe_player_overlay_frame(double dt,XeRect area){XeEvent ev[64];int n=0,i;while(n<64&&xe_platform_poll(&ev[n]))n++;xe_ui_begin(dt,ev,n);for(i=0;i<n;i++)if(ev[i].type==XE_EV_KEY_DOWN){if(ev[i].key==XE_KEY_LEFT||ev[i].key==XE_KEY_RIGHT){if(!O.visible)xe_player_seek(ev[i].key==XE_KEY_LEFT?-10:10);else O.idle=0;}if(ev[i].key==XE_KEY_ENTER||ev[i].key==XE_KEY_SPACE){if(!O.visible)O.visible=1;else xe_player_toggle();O.idle=0;}if(ev[i].key==XE_KEY_ESCAPE)xe_player_close();}
+ O.idle+=dt;if(O.idle>4.0)O.visible=0;xe_r_rect(area,0,(XeColor){0.02f,0.02f,0.025f,1});
+ if(xe_player_buffering()){
+    XeRect card={area.x+area.w*.28f,area.y+area.h*.24f,area.w*.44f,area.h*.46f};xe_r_rect(card,16,(XeColor){0.07f,0.07f,0.09f,1});
+    static float phase=0;phase+=(float)dt*0.7f;float perimeter=2*(card.w+card.h),seg=perimeter*.20f,pos=fmodf(phase*perimeter,perimeter);XeColor c=P_RED;
+    /* Four moving segments approximate a red progress trace around the card. */
+    for(i=0;i<4;i++){float p=fmodf(pos+i*perimeter/4,perimeter);XeRect r;if(p<card.w)r=(XeRect){card.x+p,card.y,seg<card.w?seg:card.w,3};else if((p-=card.w)<card.h)r=(XeRect){card.x+card.w-3,card.y+p,3,seg<card.h?seg:card.h};else if((p-=card.h)<card.w)r=(XeRect){card.x+card.w-p,card.y+card.h-3,seg<card.w?seg:card.w,3};else {p-=card.w;r=(XeRect){card.x,card.y+card.h-p,3,seg<card.h?seg:card.h};}xe_r_rect(r,2,c);}
+    txt("Loading stream…",card.x+24,card.y+card.h*.46f,22,P_WHITE);XeRect hb={card.x+12,card.y+card.h+24,card.w-24,28};xe_r_rect(hb,3,(XeColor){0.08f,0.08f,0.10f,1});for(i=0;i<20;i++){float hh=(float)((i*17+(int)(phase*19))%21)/21.0f*20;xe_r_rect((XeRect){hb.x+i*hb.w/20,hb.y+14-hh*.5f,hb.w/40+1,hh+1},1,P_RED);}txt("Buffering…",hb.x,hb.y+38,14,P_MUTED);
+ } else {
+    /* P11's host calls xe_player_mpv_render(area.w, area.h) before the overlay.
+       Video texture is drawn behind this translucent UI. */
+ }
+ if(O.visible){char a[32],b[32],ends[48],title[96];double pos=xe_player_pos(),dur=xe_player_dur();fmt_time(pos,a,sizeof(a));fmt_time(dur,b,sizeof(b));fmt_time(dur>pos?dur-pos:0,ends,sizeof(ends));snprintf(title,sizeof(title),"StreamX  •  %s", "Now Playing");xe_r_rect((XeRect){area.x,area.y,area.w,72},0,(XeColor){0,0,0,0.72f});txt(title,area.x+32,area.y+28,20,P_WHITE);txt("LIVE / PLAYER",area.x+area.w-180,area.y+28,15,P_MUTED);
+    float by=area.y+area.h-156;xe_r_rect((XeRect){area.x,by,area.w,156},0,(XeColor){0,0,0,0.78f});xe_r_rect((XeRect){area.x+48,by+30,area.w-96,4},2,(XeColor){0.45f,0.45f,0.48f,1});if(dur>0)xe_r_rect((XeRect){area.x+48,by+30,(area.w-96)*(float)(pos/dur),4},2,P_RED);char times[128];snprintf(times,sizeof(times),"%s  /  %s       Ends in %s",a,b,ends);txt(times,area.x+48,by+58,14,P_WHITE);
+    const char *labels[]={"Audio & Subtitles","Episodes","Next episode","Play / Pause","More"};float bw=(area.w-120)/5;for(i=0;i<5;i++){XeRect r={area.x+48+i*(bw+6),by+82,bw-6,48};button(O.buttons[i],r,labels[i]);if(xe_ui_activated(O.buttons[i])){if(i==3)xe_player_toggle();else if(i==0||i==4)O.menu=i+1;}}
+ }
+ xe_ui_end();}
+```
+
+============================================================
+P2 HOST REFERENCE NOTES — merge/rename to match your existing P2 files
+============================================================
+
+### FILE: app/src/main/java/com/streamx/xe/XeView.java (reference integration snippet)
+```java
+package com.streamx.xe;
+
+import android.content.Context;
+import android.opengl.GLSurfaceView;
+
+public class XeView extends GLSurfaceView {
+    public XeView(Context context) {
+        super(context);
+        setEGLContextClientVersion(2);
+        // Must request alpha for video visible underneath this GL surface.
+        setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+        setZOrderMediaOverlay(true);
+        setPreserveEGLContextOnPause(true);
+        // Keep your existing P2 renderer setup here; its clear colour must use alpha 0.
+    }
+}
+```
+
+### FILE: AndroidManifest.xml (reference)
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+```

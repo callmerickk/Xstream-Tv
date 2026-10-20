@@ -1,0 +1,871 @@
+I haven't compiled or run any of this, since there's no toolchain or display here. Two assumptions of mine: `xe_app_init()` returns 0 on success (the host aborts otherwise), and `xe_platform_set_size` takes drawable pixels. `density` is device pixels per logical (96 DPI) pixel, and pointer coordinates are also in drawable pixels.
+
+### FILE: CMakeLists.txt
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(xe LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+option(XE_GLES "Target OpenGL ES (Android) instead of desktop OpenGL 3.3 core" OFF)
+option(XE_BUILD_WIN_HOST "Build the Windows SDL2 host (xe_win) when on Windows" ON)
+
+# Android is built by Gradle (part P2); it may still add_subdirectory() this
+# project, in which case GLES is forced on.
+if(ANDROID)
+  set(XE_GLES ON CACHE BOOL "" FORCE)
+endif()
+
+file(GLOB_RECURSE XE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c)
+
+add_library(xe STATIC ${XE_SOURCES})
+target_include_directories(xe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(xe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(XE_GLES)
+  target_compile_definitions(xe PUBLIC XE_GLES=1)
+else()
+  target_compile_definitions(xe PUBLIC XE_GL33=1)
+endif()
+
+if(MSVC)
+  target_compile_options(xe PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(xe PRIVATE -Wall -Wextra)
+endif()
+
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(xe PUBLIC Threads::Threads)
+endif()
+if(ANDROID)
+  target_link_libraries(xe PUBLIC log)
+endif()
+
+# ---------------------------------------------------------------------------
+# Windows host (SDL2, desktop GL 3.3 core)
+# ---------------------------------------------------------------------------
+if(WIN32 AND NOT ANDROID AND XE_BUILD_WIN_HOST)
+  if(XE_GLES)
+    message(STATUS "xe_win skipped: it needs desktop GL (configure with -DXE_GLES=OFF)")
+  else()
+    find_package(SDL2 CONFIG REQUIRED)
+
+    # The app code linked into the host. P1 uses the test app; later parts
+    # replace this, e.g. -DXE_APP_SOURCES="src_app/app.c;src_app/ui.c"
+    set(XE_APP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/p1_test.c"
+        CACHE STRING "Sources providing xe_app_init/xe_app_frame/xe_app_shutdown")
+
+    add_executable(xe_win hosts/windows/main_sdl.c ${XE_APP_SOURCES})
+    target_link_libraries(xe_win PRIVATE xe opengl32)
+
+    if(TARGET SDL2::SDL2)
+      target_link_libraries(xe_win PRIVATE SDL2::SDL2)
+      if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+        add_custom_command(TARGET xe_win POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  $<TARGET_RUNTIME_DLLS:xe_win> $<TARGET_FILE_DIR:xe_win>
+          COMMAND_EXPAND_LISTS)
+      endif()
+    else()
+      target_link_libraries(xe_win PRIVATE SDL2::SDL2-static)
+    endif()
+
+    if(MSVC)
+      target_compile_options(xe_win PRIVATE /W4 /utf-8)
+    else()
+      target_compile_options(xe_win PRIVATE -Wall -Wextra)
+    endif()
+  endif()
+endif()
+```
+
+### FILE: include/xe/platform.h
+```c
+#ifndef XE_PLATFORM_H
+#define XE_PLATFORM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define XE_WEAK __attribute__((weak))
+#define XE_PRINTF(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#define XE_WEAK
+#define XE_PRINTF(fmt_idx, arg_idx)
+#endif
+
+typedef enum {
+    XE_KEY_NONE, XE_KEY_UP, XE_KEY_DOWN, XE_KEY_LEFT, XE_KEY_RIGHT, XE_KEY_OK, XE_KEY_BACK,
+    XE_KEY_MENU, XE_KEY_PLAYPAUSE, XE_KEY_FF, XE_KEY_RW, XE_KEY_SEARCH
+} XeKey;
+
+typedef enum {
+    XE_EV_NONE, XE_EV_KEY_DOWN, XE_EV_KEY_UP, XE_EV_TEXT, XE_EV_POINTER_DOWN, XE_EV_POINTER_MOVE,
+    XE_EV_POINTER_UP, XE_EV_SCROLL, XE_EV_RESIZE, XE_EV_PAUSE, XE_EV_RESUME, XE_EV_QUIT
+} XeEventType;
+
+/*
+ * Field use per event type:
+ *   KEY_DOWN/KEY_UP : key, repeat (non-zero for auto-repeat)
+ *   TEXT            : codepoint (Unicode scalar value)
+ *   POINTER_*       : x, y in drawable pixels; POINTER_MOVE also dx, dy
+ *   SCROLL          : dx, dy (dy > 0 = wheel up / content moves down), x, y = pointer position
+ *   RESIZE          : w, h in drawable pixels
+ */
+typedef struct {
+    XeEventType type;
+    XeKey key;
+    int repeat;
+    unsigned codepoint;
+    float x, y, dx, dy;
+    int w, h;
+} XeEvent;
+
+/* Hosts call this from any thread. Thread-safe ring buffer; if full, the oldest
+ * event is dropped (a new POINTER_MOVE is dropped instead). */
+void   xe_platform_push_event(const XeEvent *ev);
+/* Engine calls this each frame. Returns 1 and fills *out, or 0 when empty. */
+int    xe_platform_poll(XeEvent *out);
+/* Seconds, monotonic, arbitrary epoch. */
+double xe_time_now(void);
+
+/* Size is the drawable size in pixels; density = device pixels per logical pixel (1.0 = 96 dpi). */
+void   xe_platform_set_size(int w, int h, float density);
+void   xe_platform_size(int *w, int *h, float *density);
+
+/* Call once at startup, before xe_app_init. Strings are copied. Defaults to ".". */
+void   xe_platform_set_dirs(const char *data_dir, const char *cache_dir);
+const char *xe_platform_data_dir(void);
+const char *xe_platform_cache_dir(void);
+
+/* level: 0 debug, 1 info, 2 warn, 3 error. Android -> logcat tag "xe". */
+void   xe_log(int level, const char *fmt, ...) XE_PRINTF(2, 3);
+
+/* The app (written later) implements these; hosts call them.
+ * xe_app_init returns 0 on success, non-zero on failure. A GL context is current. */
+int  xe_app_init(void);
+void xe_app_frame(double dt);
+void xe_app_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* XE_PLATFORM_H */
+```
+
+### FILE: src/platform/platform_common.c
+```c
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "xe/platform.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static SRWLOCK g_lock = SRWLOCK_INIT;
+static void lock(void)   { AcquireSRWLockExclusive(&g_lock); }
+static void unlock(void) { ReleaseSRWLockExclusive(&g_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void)   { pthread_mutex_lock(&g_lock); }
+static void unlock(void) { pthread_mutex_unlock(&g_lock); }
+#endif
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
+/* ------------------------------------------------------------------ events */
+
+#define XE_QUEUE_CAP 512
+
+static XeEvent  g_queue[XE_QUEUE_CAP];
+static unsigned g_head;
+static unsigned g_count;
+
+void xe_platform_push_event(const XeEvent *ev)
+{
+    if (!ev) return;
+    lock();
+    if (g_count == XE_QUEUE_CAP) {
+        if (ev->type == XE_EV_POINTER_MOVE) {
+            unlock();
+            return;
+        }
+        g_head = (g_head + 1) % XE_QUEUE_CAP; /* drop oldest */
+        g_count--;
+    }
+    g_queue[(g_head + g_count) % XE_QUEUE_CAP] = *ev;
+    g_count++;
+    unlock();
+}
+
+int xe_platform_poll(XeEvent *out)
+{
+    int got = 0;
+    if (!out) return 0;
+    lock();
+    if (g_count > 0) {
+        *out = g_queue[g_head];
+        g_head = (g_head + 1) % XE_QUEUE_CAP;
+        g_count--;
+        got = 1;
+    }
+    unlock();
+    return got;
+}
+
+/* -------------------------------------------------------------------- time */
+
+double xe_time_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+
+/* -------------------------------------------------------------------- size */
+
+static int   g_w, g_h;
+static float g_density = 1.0f;
+
+void xe_platform_set_size(int w, int h, float density)
+{
+    lock();
+    g_w = w;
+    g_h = h;
+    g_density = density > 0.0f ? density : 1.0f;
+    unlock();
+}
+
+void xe_platform_size(int *w, int *h, float *density)
+{
+    lock();
+    if (w) *w = g_w;
+    if (h) *h = g_h;
+    if (density) *density = g_density;
+    unlock();
+}
+
+/* -------------------------------------------------------------------- dirs */
+
+static char g_data_dir[1024]  = ".";
+static char g_cache_dir[1024] = ".";
+
+void xe_platform_set_dirs(const char *data_dir, const char *cache_dir)
+{
+    lock();
+    snprintf(g_data_dir, sizeof g_data_dir, "%s", (data_dir && *data_dir) ? data_dir : ".");
+    snprintf(g_cache_dir, sizeof g_cache_dir, "%s", (cache_dir && *cache_dir) ? cache_dir : ".");
+    unlock();
+}
+
+/* Set once at startup; the returned pointers stay valid until the next set_dirs. */
+const char *xe_platform_data_dir(void)  { return g_data_dir; }
+const char *xe_platform_cache_dir(void) { return g_cache_dir; }
+
+/* --------------------------------------------------------------------- log */
+
+void xe_log(int level, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+
+    if (!fmt) fmt = "";
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+
+#ifdef __ANDROID__
+    {
+        static const int prio[4] = { ANDROID_LOG_DEBUG, ANDROID_LOG_INFO,
+                                     ANDROID_LOG_WARN, ANDROID_LOG_ERROR };
+        __android_log_write(prio[level], "xe", buf);
+    }
+#else
+    {
+        static const char tag[4] = { 'D', 'I', 'W', 'E' };
+        fprintf(stderr, "[%9.3f] %c xe: %s\n", xe_time_now(), tag[level], buf);
+        fflush(stderr);
+#ifdef _WIN32
+        {
+            char line[1100];
+            snprintf(line, sizeof line, "xe: %s\n", buf);
+            OutputDebugStringA(line);
+        }
+#endif
+    }
+#endif
+}
+```
+
+### FILE: hosts/windows/main_sdl.c
+```c
+/* Windows host: SDL2 window + GL 3.3 core context, vsync, high-DPI, F11 fullscreen. */
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
+#include <SDL_opengl.h>
+
+#include <direct.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+
+#include "xe/platform.h"
+
+static int   g_w, g_h;
+static float g_density = 1.0f;
+static float g_ptr_scale = 1.0f; /* window coords -> drawable pixels */
+static int   g_search_active;    /* Ctrl+F is held */
+
+/* ------------------------------------------------------------------ helpers */
+
+static void push_simple(XeEventType t)
+{
+    XeEvent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = t;
+    xe_platform_push_event(&ev);
+}
+
+static void push_key(XeEventType t, XeKey k, int repeat)
+{
+    XeEvent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = t;
+    ev.key = k;
+    ev.repeat = repeat;
+    xe_platform_push_event(&ev);
+}
+
+static void push_text(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned cp;
+        int n, i;
+        XeEvent ev;
+        if (*p < 0x80)                { cp = *p;        n = 1; }
+        else if ((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; n = 2; }
+        else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; n = 3; }
+        else if ((*p & 0xF8) == 0xF0) { cp = *p & 0x07; n = 4; }
+        else { p++; continue; }
+        for (i = 1; i < n; i++) {
+            if ((p[i] & 0xC0) != 0x80) { n = i; cp = 0xFFFD; break; }
+            cp = (cp << 6) | (p[i] & 0x3F);
+        }
+        memset(&ev, 0, sizeof ev);
+        ev.type = XE_EV_TEXT;
+        ev.codepoint = cp;
+        xe_platform_push_event(&ev);
+        p += n;
+    }
+}
+
+static XeKey map_key(SDL_Keycode k)
+{
+    switch (k) {
+    case SDLK_UP:        return XE_KEY_UP;
+    case SDLK_DOWN:      return XE_KEY_DOWN;
+    case SDLK_LEFT:      return XE_KEY_LEFT;
+    case SDLK_RIGHT:     return XE_KEY_RIGHT;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:  return XE_KEY_OK;
+    case SDLK_ESCAPE:
+    case SDLK_BACKSPACE: return XE_KEY_BACK;
+    case SDLK_SPACE:
+    case SDLK_AUDIOPLAY: return XE_KEY_PLAYPAUSE;
+    case SDLK_m:         return XE_KEY_MENU;
+    case SDLK_AUDIOFASTFORWARD: return XE_KEY_FF;
+    case SDLK_AUDIOREWIND:      return XE_KEY_RW;
+    default:             return XE_KEY_NONE;
+    }
+}
+
+static void toggle_fullscreen(SDL_Window *w)
+{
+    Uint32 f = SDL_GetWindowFlags(w);
+    int fs = (f & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (SDL_SetWindowFullscreen(w, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+        xe_log(2, "fullscreen toggle failed: %s", SDL_GetError());
+}
+
+static float query_density(SDL_Window *win)
+{
+    int ww = 0, wh = 0, dw = 0, dh = 0;
+    float d = 1.0f;
+    SDL_GetWindowSize(win, &ww, &wh);
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    if (ww > 0) d = (float)dw / (float)ww;
+    if (d < 1.01f) {
+        /* Windows reports window size in real pixels; derive scale from DPI. */
+        float ddpi = 0.0f;
+        int idx = SDL_GetWindowDisplayIndex(win);
+        if (idx >= 0 && SDL_GetDisplayDPI(idx, &ddpi, NULL, NULL) == 0 && ddpi > 0.0f)
+            d = ddpi / 96.0f;
+    }
+    return d < 0.5f ? 1.0f : d;
+}
+
+static void update_size(SDL_Window *win, int force)
+{
+    int ww = 0, wh = 0, dw = 0, dh = 0;
+    float d;
+    SDL_GetWindowSize(win, &ww, &wh);
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    if (dw <= 0 || dh <= 0) return; /* minimised */
+    d = query_density(win);
+    g_ptr_scale = ww > 0 ? (float)dw / (float)ww : 1.0f;
+    if (!force && dw == g_w && dh == g_h && d == g_density) return;
+    g_w = dw;
+    g_h = dh;
+    g_density = d;
+    xe_platform_set_size(dw, dh, d);
+    {
+        XeEvent ev;
+        memset(&ev, 0, sizeof ev);
+        ev.type = XE_EV_RESIZE;
+        ev.w = dw;
+        ev.h = dh;
+        xe_platform_push_event(&ev);
+    }
+}
+
+static void make_dir_utf8(const char *path)
+{
+    wchar_t w[1024];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024)) _wmkdir(w);
+}
+
+static void setup_dirs(void)
+{
+    char *pref = SDL_GetPrefPath("xe", "xe");
+    char data[1024], cache[1100];
+    size_t n;
+    if (!pref) {
+        xe_log(2, "SDL_GetPrefPath failed: %s", SDL_GetError());
+        return;
+    }
+    snprintf(data, sizeof data, "%s", pref);
+    SDL_free(pref);
+    n = strlen(data);
+    while (n > 0 && (data[n - 1] == '\\' || data[n - 1] == '/')) data[--n] = 0;
+    snprintf(cache, sizeof cache, "%s\\cache", data);
+    make_dir_utf8(cache);
+    xe_platform_set_dirs(data, cache);
+}
+
+/* --------------------------------------------------------------------- main */
+
+int main(int argc, char **argv)
+{
+    SDL_Window *win;
+    SDL_GLContext ctx;
+    int i, running = 1, minimized = 0, vsync_ok;
+    unsigned long frames = 0, max_frames = 0;
+    double last;
+    float d0;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
+            max_frames = strtoul(argv[++i], NULL, 10);
+    }
+
+    SDL_SetMainReady();
+    SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+        xe_log(3, "SDL_Init failed: %s", SDL_GetError());
+        return 1;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+
+    win = SDL_CreateWindow("xe", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
+                           SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!win) {
+        xe_log(3, "SDL_CreateWindow failed: %s", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    /* On high-DPI displays make the window physically ~1280x720 logical. */
+    d0 = query_density(win);
+    if (d0 > 1.01f && (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) == 0) {
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(win, &ww, &wh);
+        if ((float)ww / 1280.0f < d0 * 0.99f && ww == 1280) {
+            SDL_SetWindowSize(win, (int)(1280 * d0), (int)(720 * d0));
+            SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+    }
+
+    ctx = SDL_GL_CreateContext(win);
+    if (!ctx) {
+        xe_log(3, "GL 3.3 core context failed: %s", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+    SDL_GL_MakeCurrent(win, ctx);
+
+    vsync_ok = (SDL_GL_SetSwapInterval(1) == 0);
+    if (!vsync_ok) xe_log(2, "vsync unavailable: %s", SDL_GetError());
+
+    setup_dirs();
+    update_size(win, 1);
+
+    xe_log(1, "GL_VERSION  : %s", (const char *)glGetString(GL_VERSION));
+    xe_log(1, "GL_RENDERER : %s", (const char *)glGetString(GL_RENDERER));
+    xe_log(1, "drawable %dx%d density %.2f", g_w, g_h, g_density);
+
+    if (xe_app_init() != 0) {
+        xe_log(3, "xe_app_init failed");
+        SDL_GL_DeleteContext(ctx);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 2;
+    }
+
+    last = xe_time_now();
+    while (running) {
+        SDL_Event e;
+        double now, dt;
+
+        while (SDL_PollEvent(&e)) {
+            switch (e.type) {
+            case SDL_QUIT:
+                push_simple(XE_EV_QUIT);
+                running = 0; /* the app still gets one more frame to see it */
+                break;
+
+            case SDL_WINDOWEVENT:
+                if (e.window.event == SDL_WINDOWEVENT_MINIMIZED) {
+                    minimized = 1;
+                    push_simple(XE_EV_PAUSE);
+                } else if (e.window.event == SDL_WINDOWEVENT_RESTORED && minimized) {
+                    minimized = 0;
+                    push_simple(XE_EV_RESUME);
+                }
+                break;
+
+            case SDL_KEYDOWN: {
+                SDL_Keycode sym = e.key.keysym.sym;
+                if (sym == SDLK_F11) {
+                    if (!e.key.repeat) toggle_fullscreen(win);
+                    break;
+                }
+                if (sym == SDLK_f && (e.key.keysym.mod & KMOD_CTRL)) {
+                    g_search_active = 1;
+                    push_key(XE_EV_KEY_DOWN, XE_KEY_SEARCH, e.key.repeat != 0);
+                    break;
+                }
+                {
+                    XeKey k = map_key(sym);
+                    if (k != XE_KEY_NONE) push_key(XE_EV_KEY_DOWN, k, e.key.repeat != 0);
+                }
+                break;
+            }
+
+            case SDL_KEYUP: {
+                SDL_Keycode sym = e.key.keysym.sym;
+                if (sym == SDLK_f && g_search_active) {
+                    g_search_active = 0;
+                    push_key(XE_EV_KEY_UP, XE_KEY_SEARCH, 0);
+                    break;
+                }
+                {
+                    XeKey k = map_key(sym);
+                    if (k != XE_KEY_NONE) push_key(XE_EV_KEY_UP, k, 0);
+                }
+                break;
+            }
+
+            case SDL_TEXTINPUT:
+                push_text(e.text.text);
+                break;
+
+            case SDL_MOUSEBUTTONDOWN:
+            case SDL_MOUSEBUTTONUP:
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                    XeEvent ev;
+                    memset(&ev, 0, sizeof ev);
+                    ev.type = e.type == SDL_MOUSEBUTTONDOWN ? XE_EV_POINTER_DOWN : XE_EV_POINTER_UP;
+                    ev.x = (float)e.button.x * g_ptr_scale;
+                    ev.y = (float)e.button.y * g_ptr_scale;
+                    xe_platform_push_event(&ev);
+                }
+                break;
+
+            case SDL_MOUSEMOTION: {
+                XeEvent ev;
+                memset(&ev, 0, sizeof ev);
+                ev.type = XE_EV_POINTER_MOVE;
+                ev.x = (float)e.motion.x * g_ptr_scale;
+                ev.y = (float)e.motion.y * g_ptr_scale;
+                ev.dx = (float)e.motion.xrel * g_ptr_scale;
+                ev.dy = (float)e.motion.yrel * g_ptr_scale;
+                xe_platform_push_event(&ev);
+                break;
+            }
+
+            case SDL_MOUSEWHEEL: {
+                XeEvent ev;
+                int mx = 0, my = 0;
+                float sgn = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
+                SDL_GetMouseState(&mx, &my);
+                memset(&ev, 0, sizeof ev);
+                ev.type = XE_EV_SCROLL;
+                ev.x = (float)mx * g_ptr_scale;
+                ev.y = (float)my * g_ptr_scale;
+                ev.dx = sgn * (float)e.wheel.x;
+                ev.dy = sgn * (float)e.wheel.y;
+                xe_platform_push_event(&ev);
+                break;
+            }
+
+            default:
+                break;
+            }
+        }
+
+        update_size(win, 0);
+
+        now = xe_time_now();
+        dt = now - last;
+        last = now;
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.25) dt = 0.25;
+
+        glViewport(0, 0, g_w, g_h);
+        xe_app_frame(dt);
+        SDL_GL_SwapWindow(win);
+
+        if (minimized) SDL_Delay(50);
+        else if (!vsync_ok) SDL_Delay(1);
+
+        frames++;
+        if (max_frames && frames >= max_frames) running = 0;
+    }
+
+    xe_app_shutdown();
+    SDL_GL_DeleteContext(ctx);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+}
+```
+
+### FILE: tests/p1_test.c
+```c
+/* P1 test app: clears to a colour driven by the arrow keys and prints every event.
+ *   LEFT/RIGHT = hue, UP/DOWN = brightness, OK = reset.
+ * The xe_app_* functions are weak so a real app can override them. */
+#include "xe/platform.h"
+
+#if defined(XE_GLES)
+#include <GLES2/gl2.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#include <GL/gl.h>
+#else
+#include <GL/gl.h>
+#endif
+
+static float  g_hue = 0.60f;
+static float  g_val = 0.35f;
+static double g_fps_t;
+static int    g_fps_frames;
+
+static const char *k_key_names[] = {
+    "NONE", "UP", "DOWN", "LEFT", "RIGHT", "OK", "BACK",
+    "MENU", "PLAYPAUSE", "FF", "RW", "SEARCH"
+};
+static const char *k_ev_names[] = {
+    "NONE", "KEY_DOWN", "KEY_UP", "TEXT", "POINTER_DOWN", "POINTER_MOVE",
+    "POINTER_UP", "SCROLL", "RESIZE", "PAUSE", "RESUME", "QUIT"
+};
+
+static const char *key_name(XeKey k)
+{
+    return (unsigned)k < sizeof k_key_names / sizeof k_key_names[0] ? k_key_names[k] : "?";
+}
+static const char *ev_name(XeEventType t)
+{
+    return (unsigned)t < sizeof k_ev_names / sizeof k_ev_names[0] ? k_ev_names[t] : "?";
+}
+
+static void hsv_to_rgb(float h, float s, float v, float *r, float *g, float *b)
+{
+    int i;
+    float f, p, q, t;
+    h -= (float)(int)h;
+    if (h < 0.0f) h += 1.0f;
+    h *= 6.0f;
+    i = (int)h;
+    f = h - (float)i;
+    p = v * (1.0f - s);
+    q = v * (1.0f - f * s);
+    t = v * (1.0f - (1.0f - f) * s);
+    switch (i % 6) {
+    case 0: *r = v; *g = t; *b = p; break;
+    case 1: *r = q; *g = v; *b = p; break;
+    case 2: *r = p; *g = v; *b = t; break;
+    case 3: *r = p; *g = q; *b = v; break;
+    case 4: *r = t; *g = p; *b = v; break;
+    default: *r = v; *g = p; *b = q; break;
+    }
+}
+
+static float clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
+
+static void handle(const XeEvent *ev)
+{
+    switch (ev->type) {
+    case XE_EV_KEY_DOWN:
+    case XE_EV_KEY_UP:
+        xe_log(1, "%s key=%s repeat=%d", ev_name(ev->type), key_name(ev->key), ev->repeat);
+        break;
+    case XE_EV_TEXT:
+        xe_log(1, "TEXT U+%04X", ev->codepoint);
+        break;
+    case XE_EV_POINTER_DOWN:
+    case XE_EV_POINTER_UP:
+        xe_log(1, "%s at %.0f,%.0f", ev_name(ev->type), ev->x, ev->y);
+        break;
+    case XE_EV_POINTER_MOVE:
+        xe_log(0, "POINTER_MOVE at %.0f,%.0f d=%.0f,%.0f", ev->x, ev->y, ev->dx, ev->dy);
+        break;
+    case XE_EV_SCROLL:
+        xe_log(1, "SCROLL d=%.1f,%.1f at %.0f,%.0f", ev->dx, ev->dy, ev->x, ev->y);
+        break;
+    case XE_EV_RESIZE:
+        xe_log(1, "RESIZE %dx%d", ev->w, ev->h);
+        break;
+    default:
+        xe_log(1, "%s", ev_name(ev->type));
+        break;
+    }
+
+    if (ev->type == XE_EV_KEY_DOWN) {
+        switch (ev->key) {
+        case XE_KEY_LEFT:  g_hue -= 0.02f; break;
+        case XE_KEY_RIGHT: g_hue += 0.02f; break;
+        case XE_KEY_UP:    g_val = clamp01(g_val + 0.05f); break;
+        case XE_KEY_DOWN:  g_val = clamp01(g_val - 0.05f); break;
+        case XE_KEY_OK:    g_hue = 0.60f; g_val = 0.35f; break;
+        default: break;
+        }
+    }
+}
+
+XE_WEAK int xe_app_init(void)
+{
+    int w, h;
+    float d;
+    xe_platform_size(&w, &h, &d);
+    xe_log(1, "p1_test init: %dx%d density %.2f", w, h, d);
+    xe_log(1, "data dir : %s", xe_platform_data_dir());
+    xe_log(1, "cache dir: %s", xe_platform_cache_dir());
+    g_fps_t = xe_time_now();
+    return 0;
+}
+
+XE_WEAK void xe_app_frame(double dt)
+{
+    XeEvent ev;
+    float r, g, b;
+    int w, h;
+    double now;
+    (void)dt;
+
+    while (xe_platform_poll(&ev)) handle(&ev);
+
+    xe_platform_size(&w, &h, NULL);
+    if (w > 0 && h > 0) glViewport(0, 0, w, h);
+    hsv_to_rgb(g_hue, 0.8f, g_val, &r, &g, &b);
+    glClearColor(r, g, b, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    g_fps_frames++;
+    now = xe_time_now();
+    if (now - g_fps_t >= 1.0) {
+        xe_log(0, "fps %.1f (%dx%d)", g_fps_frames / (now - g_fps_t), w, h);
+        g_fps_frames = 0;
+        g_fps_t = now;
+    }
+}
+
+XE_WEAK void xe_app_shutdown(void)
+{
+    xe_log(1, "p1_test shutdown");
+}
+```
+
+### FILE: third_party/README.md
+```markdown
+# third_party
+
+No third-party source code lives in this repository. This file records where each
+dependency comes from and under which licence. Licence names are from my own
+knowledge; confirm them against each project's own licence file before shipping.
+
+## Used by P1
+
+| Dependency | Used by | How to get it | Licence |
+|---|---|---|---|
+| SDL2 (2.24+ recommended) | `hosts/windows` (window, GL context, input) | `vcpkg install sdl2:x64-windows`, or the official release from https://libsdl.org | zlib |
+| OpenGL (`opengl32`) | Windows host and tests (GL 1.x entry points) | Ships with Windows | OS component |
+| OpenGL ES headers and `liblog` | Android builds (P2) | Ships with the Android NDK sysroot | NDK licences |
+| vcpkg (build tool only) | Fetching SDL2 on Windows | https://github.com/microsoft/vcpkg | MIT |
+
+## Build (Windows)
+
+    vcpkg install sdl2:x64-windows
+    cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
+    cmake --build build --config Release
+    build\Release\xe_win.exe            (add --frames 120 to exit automatically)
+
+## Adding a dependency in a later part
+
+Add a row with: name and pinned version, where it is fetched from (URL or package
+manager), licence, and link mode. Anything LGPL or GPL must be linked dynamically
+or avoided. Vendored code, if ever needed, goes in `third_party/<name>/` with its
+licence file next to it.
+```
+
+Notes:
+- **Keyboard:** F11 is consumed by the host and never reaches the engine. Ctrl+F emits `XE_KEY_SEARCH`, and its key-up follows when F is released. I also mapped the media keys Play, Fast-forward and Rewind to `PLAYPAUSE`, `FF` and `RW`, which you didn't ask for.
+- **Exiting the test:** close the window. There is no engine-to-host quit call in the fixed API, so I added `--frames N` to `xe_win` for automated runs.
+- **Windows subsystem:** `xe_win` is a console executable so the test's event output is visible. Switching to a GUI subsystem would need a `WinMain` entry.
+- **Android:** `platform_common.c` uses `__android_log_write` and the `xe` target links `log` on Android. Your P2 Gradle build must use the root CMake, or add `log` itself.
+- **Events:** the queue holds 512 events. When full it drops the oldest one, or the new event if it's a pointer move.
+- **Pause:** while the window is minimised the host keeps calling `xe_app_frame` every 50 ms and sends `XE_EV_PAUSE`/`XE_EV_RESUME`.

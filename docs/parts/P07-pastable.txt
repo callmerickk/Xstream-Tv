@@ -1,0 +1,287 @@
+XE P7 — UI CORE: LAYOUT, FOCUS, ANIMATION, SCROLLING
+====================================================
+
+Integration
+-----------
+Depends on P1 include/xe/platform.h and P3 include/xe/render.h. P4 text.h is
+used by screens for labels but is not required by this UI core. Call
+xe_ui_begin(dt, events, n), declare targets with xe_ui_focusable(), query
+xe_ui_activated(), draw, then call xe_ui_end(). Target rectangles are remembered
+from the previous frame for directional navigation. The caller draws focus
+visuals with xe_ui_focus_anim() and P3 rendering calls.
+
+### FILE: include/xe/anim.h
+```c
+#ifndef XE_ANIM_H
+#define XE_ANIM_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float value, target, velocity; float stiffness, damping; } XeSpring;
+void xe_spring_init(XeSpring *s, float v, float stiffness, float damping);
+void xe_spring_step(XeSpring *s, double dt);
+int xe_spring_resting(const XeSpring *s);
+float xe_ease_out_cubic(float t);
+float xe_ease_in_out(float t);
+typedef struct { float from, to; double start, dur; } XeTween;
+float xe_tween_value(XeTween *t, double now);
+int xe_anim_any_running(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/ui/anim.c
+```c
+#include "xe/anim.h"
+#include <math.h>
+#define XE_ANIM_EPS 0.001f
+static int g_running;
+void xe_spring_init(XeSpring *s,float v,float stiffness,float damping) {
+    if(!s) return; s->value=v; s->target=v; s->velocity=0;
+    s->stiffness=stiffness>0?stiffness:180.0f; s->damping=damping>=0?damping:24.0f;
+}
+void xe_spring_step(XeSpring *s,double dt) {
+    float d,a; if(!s||dt<=0) return; if(dt>0.05) dt=0.05; d=(float)dt;
+    /* Cap dt so a resume after a pause cannot kick the spring far off target. */
+    a=(s->target-s->value)*s->stiffness-s->velocity*s->damping;
+    s->velocity+=a*d; s->value+=s->velocity*d;
+    if(fabsf(s->target-s->value)<XE_ANIM_EPS && fabsf(s->velocity)<XE_ANIM_EPS) {
+        s->value=s->target; s->velocity=0;
+    }
+}
+int xe_spring_resting(const XeSpring *s) {
+    return !s || (fabsf(s->target-s->value)<XE_ANIM_EPS && fabsf(s->velocity)<XE_ANIM_EPS);
+}
+float xe_ease_out_cubic(float t) { float u; if(t<0)t=0; if(t>1)t=1; u=1-t; return 1-u*u*u; }
+float xe_ease_in_out(float t) {
+    if(t<0)t=0; if(t>1)t=1;
+    return t<0.5f ? 4*t*t*t : 1.0f-(float)(pow((double)(-2*t+2),3.0)*0.5);
+}
+float xe_tween_value(XeTween *t,double now) {
+    float p; if(!t)return 0; if(t->dur<=0)return t->to;
+    p=(float)((now-t->start)/t->dur); if(p<=0)return t->from; if(p>=1)return t->to;
+    return t->from+(t->to-t->from)*xe_ease_out_cubic(p);
+}
+int xe_anim_any_running(void) { return g_running; }
+void xe_anim_internal_set_running(int running) { g_running=running!=0; }
+```
+
+### FILE: include/xe/ui.h
+```c
+#ifndef XE_UI_H
+#define XE_UI_H
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/anim.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef unsigned long long XeId;
+XeId xe_id(const char *s);
+XeId xe_id_mix(XeId a, long long n);
+void xe_ui_begin(double dt, const XeEvent *events, int n);
+void xe_ui_end(void);
+int xe_ui_focusable(XeId id, XeRect r);
+int xe_ui_activated(XeId id);
+void xe_ui_set_focus(XeId id);
+XeId xe_ui_focus(void);
+float xe_ui_focus_anim(XeId id);
+typedef struct { XeId id; float offset; XeSpring spring; int count; float item_w, gap; } XeRow;
+void xe_row_scroll_to(XeRow *row, int index, float view_w);
+typedef struct { XeId id; float offset; XeSpring spring; int count; float item_h, gap; } XeColumn;
+void xe_column_scroll_to(XeColumn *column, int index, float view_h);
+/* Register each viewport per frame; offset is owned by the caller. */
+void xe_ui_set_scroll_view(XeId id, XeRect viewport, float *offset, float content_extent, int vertical);
+float xe_ui_pointer_scroll_delta(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/ui/ui.c
+```c
+#include "xe/ui.h"
+#include <stdint.h>
+#include <math.h>
+#define MAX_TARGETS 1024
+#define MAX_ANIMS 512
+#define MAX_SCROLLS 32
+#define DRAG_THRESHOLD 6.0f
+typedef struct { XeId id; XeRect r; } Target;
+typedef struct { XeId id; XeSpring spring; unsigned long age; int used; } FocusAnim;
+typedef struct { XeId id; XeRect rect; float *offset; float extent; int vertical,used; } ScrollView;
+static Target prev[MAX_TARGETS],cur[MAX_TARGETS]; static int np,nc;
+static FocusAnim anims[MAX_ANIMS]; static ScrollView scrolls[MAX_SCROLLS];
+static XeId focus,activated[MAX_TARGETS]; static int na;
+static const XeEvent *evs; static int nev; static double frame_dt;
+static unsigned long age_counter; static float scroll_delta;
+static int pointer_down,dragging; static float px0,py0,px,py;
+static int any_running;
+extern void xe_anim_internal_set_running(int running);
+static uint64_t hashstr(const char *s) {
+    uint64_t h=UINT64_C(1469598103934665603); const unsigned char *p=(const unsigned char*)s;
+    while(*p){h^=*p++;h*=UINT64_C(1099511628211);} return h?h:1;
+}
+XeId xe_id(const char *s){return s?(XeId)hashstr(s):1;}
+XeId xe_id_mix(XeId a,long long n){
+    uint64_t x=(uint64_t)a^((uint64_t)n+UINT64_C(0x9e3779b97f4a7c15)+((uint64_t)a<<6)+((uint64_t)a>>2));
+    x^=x>>30;x*=UINT64_C(0xbf58476d1ce4e5b9);x^=x>>27;x*=UINT64_C(0x94d049bb133111eb);x^=x>>31;return x?(XeId)x:1;
+}
+static int contains(XeRect r,float x,float y){return x>=r.x&&y>=r.y&&x<=r.x+r.w&&y<=r.y+r.h;}
+static int find_target(Target *a,int n,XeId id){int i;for(i=0;i<n;i++)if(a[i].id==id)return i;return -1;}
+static FocusAnim *get_anim(XeId id,int create){
+    int i,slot=-1,oldest=0; unsigned long oldage=~0UL;
+    for(i=0;i<MAX_ANIMS;i++){
+        if(anims[i].used&&anims[i].id==id){anims[i].age=++age_counter;return &anims[i];}
+        if(!anims[i].used&&slot<0)slot=i;
+        if(anims[i].used&&anims[i].age<oldage){oldage=anims[i].age;oldest=i;}
+    }
+    if(!create)return NULL; if(slot<0)slot=oldest;
+    anims[slot].used=1;anims[slot].id=id;anims[slot].age=++age_counter;
+    xe_spring_init(&anims[slot].spring,id==focus?1.0f:0.0f,220,27);return &anims[slot];
+}
+static XeId navigate(XeId id,XeKey key){
+    int fi=find_target(prev,np,id),i,best=-1;float bestscore=1.0e30f,ax,ay;XeRect a;
+    if(fi<0)return id;a=prev[fi].r;ax=a.x+a.w*.5f;ay=a.y+a.h*.5f;
+    for(i=0;i<np;i++){
+        XeRect b=prev[i].r;float bx,by,p,s,score;if(prev[i].id==id)continue;
+        bx=b.x+b.w*.5f;by=b.y+b.h*.5f;
+        if(key==XE_KEY_RIGHT){p=bx-ax;s=fabsf(by-ay);}else if(key==XE_KEY_LEFT){p=ax-bx;s=fabsf(by-ay);}
+        else if(key==XE_KEY_DOWN){p=by-ay;s=fabsf(bx-ax);}else{p=ay-by;s=fabsf(bx-ax);}
+        if(p<=.5f)continue;score=p+s*2.4f;
+        if((key==XE_KEY_LEFT||key==XE_KEY_RIGHT)&&s<=(a.h+b.h)*.5f)score*=.45f;
+        if((key==XE_KEY_UP||key==XE_KEY_DOWN)&&s<=(a.w+b.w)*.5f)score*=.45f;
+        if(score<bestscore){bestscore=score;best=i;}
+    }
+    return best>=0?prev[best].id:id;
+}
+static ScrollView *scroll_at(float x,float y){
+    int i;for(i=MAX_SCROLLS-1;i>=0;i--)if(scrolls[i].used&&scrolls[i].offset&&contains(scrolls[i].rect,x,y))return &scrolls[i];return NULL;
+}
+static void apply_scroll(ScrollView *s,float delta){
+    float view,maxoff;if(!s||!s->offset)return;view=s->vertical?s->rect.h:s->rect.w;maxoff=s->extent-view;if(maxoff<0)maxoff=0;
+    *s->offset+=delta;if(*s->offset<0)*s->offset=0;if(*s->offset>maxoff)*s->offset=maxoff;
+}
+void xe_ui_begin(double dt,const XeEvent *events,int n){
+    int i;frame_dt=dt<0?0:dt;if(frame_dt>.05)frame_dt=.05;evs=events;nev=(events&&n>0)?n:0;nc=0;na=0;scroll_delta=0;
+    for(i=0;i<nev;i++){
+        const XeEvent *e=&evs[i];
+        if(e->type==XE_EV_KEY_DOWN){
+            if(e->key==XE_KEY_LEFT||e->key==XE_KEY_RIGHT||e->key==XE_KEY_UP||e->key==XE_KEY_DOWN){if(focus)focus=navigate(focus,e->key);}
+            else if(e->key==XE_KEY_OK&&focus&&na<MAX_TARGETS)activated[na++]=focus;
+        }else if(e->type==XE_EV_POINTER_DOWN){pointer_down=1;dragging=0;px0=px=e->x;py0=py=e->y;}
+        else if(e->type==XE_EV_POINTER_MOVE&&pointer_down){
+            float dx=e->x-px,dy=e->y-py;if(fabsf(e->x-px0)+fabsf(e->y-py0)>DRAG_THRESHOLD)dragging=1;
+            if(dragging){ScrollView *s=scroll_at(px0,py0);if(s){float d=s->vertical?-dy:-dx;apply_scroll(s,d);scroll_delta+=d;}}
+            px=e->x;py=e->y;
+        }else if(e->type==XE_EV_POINTER_UP){
+            if(pointer_down&&!dragging){int j;for(j=np-1;j>=0;j--)if(contains(prev[j].r,e->x,e->y)){focus=prev[j].id;if(na<MAX_TARGETS)activated[na++]=focus;break;}}
+            pointer_down=0;dragging=0;
+        }else if(e->type==XE_EV_SCROLL){ScrollView *s=scroll_at(e->x,e->y);if(s){float d=s->vertical?e->dy:e->dx;apply_scroll(s,d);scroll_delta+=d;}}
+    }
+    for(i=0;i<MAX_ANIMS;i++)if(anims[i].used){anims[i].spring.target=anims[i].id==focus?1:0;xe_spring_step(&anims[i].spring,frame_dt);}
+    if(!focus&&np)focus=prev[0].id;
+}
+int xe_ui_focusable(XeId id,XeRect r){int k;if(!id||nc>=MAX_TARGETS)return 0;k=find_target(cur,nc,id);if(k<0)k=nc++;
+    cur[k].id=id;cur[k].r=r;(void)get_anim(id,1);if(!focus)focus=id;return focus==id;}
+int xe_ui_activated(XeId id){int i;for(i=0;i<na;i++)if(activated[i]==id)return 1;return 0;}
+void xe_ui_set_focus(XeId id){focus=id;} XeId xe_ui_focus(void){return focus;}
+float xe_ui_focus_anim(XeId id){FocusAnim *a=get_anim(id,0);return a?a->spring.value:(id==focus?1:0);}
+void xe_ui_set_scroll_view(XeId id,XeRect rect,float *offset,float extent,int vertical){
+    int i,slot=-1;for(i=0;i<MAX_SCROLLS;i++){if(scrolls[i].used&&scrolls[i].id==id){slot=i;break;}if(!scrolls[i].used&&slot<0)slot=i;}
+    if(slot<0)return;scrolls[slot].used=1;scrolls[slot].id=id;scrolls[slot].rect=rect;scrolls[slot].offset=offset;
+    scrolls[slot].extent=extent>0?extent:0;scrolls[slot].vertical=vertical!=0;
+}
+float xe_ui_pointer_scroll_delta(void){return scroll_delta;}
+static float scroll_target(float off,int index,int count,float item,float gap,float view){
+    float start,end,maxoff;if(count<=0||item<=0)return 0;if(index<0)index=0;if(index>=count)index=count-1;
+    start=index*(item+gap);end=start+item;maxoff=count*item+(count-1)*gap-view;if(maxoff<0)maxoff=0;
+    if(start<off)off=start;else if(end>off+view)off=end-view;if(off<0)off=0;if(off>maxoff)off=maxoff;return off;
+}
+void xe_row_scroll_to(XeRow *r,int index,float view_w){float target;if(!r)return;target=scroll_target(r->offset,index,r->count,r->item_w,r->gap,view_w);r->spring.target=target;xe_spring_step(&r->spring,frame_dt);r->offset=r->spring.value;}
+void xe_column_scroll_to(XeColumn *c,int index,float view_h){float target;if(!c)return;target=scroll_target(c->offset,index,c->count,c->item_h,c->gap,view_h);c->spring.target=target;xe_spring_step(&c->spring,frame_dt);c->offset=c->spring.value;}
+void xe_ui_end(void){int i;np=nc;for(i=0;i<nc;i++)prev[i]=cur[i];any_running=0;
+    for(i=0;i<MAX_ANIMS;i++)if(anims[i].used&&!xe_spring_resting(&anims[i].spring)){any_running=1;break;}
+    xe_anim_internal_set_running(any_running);
+}
+```
+
+### FILE: tests/p7_test.c
+```c
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/ui.h"
+#include <stdio.h>
+int xe_app_init(void){return 1;}
+void xe_app_frame(double dt){
+    XeEvent events[64];int n=0,row,col,w=1280,h=720;float density=1;static XeId ids[6][20];static XeRow rows[6];static int init;static double acc=0;
+    while(n<64&&xe_platform_poll(&events[n]))n++;xe_platform_size(&w,&h,&density);
+    if(!init){for(row=0;row<6;row++){rows[row].id=xe_id_mix(xe_id("p7-row"),row);rows[row].count=20;rows[row].item_w=112;rows[row].gap=14;rows[row].offset=0;xe_spring_init(&rows[row].spring,0,190,25);
+        for(col=0;col<20;col++)ids[row][col]=xe_id_mix(xe_id_mix(xe_id("p7-card"),row),col);}init=1;}
+    xe_ui_begin(dt,events,n);xe_r_begin(w,h);xe_r_rect((XeRect){0,0,(float)w,(float)h},0,(XeColor){.035f,.045f,.07f,1});
+    for(row=0;row<6;row++){float y=42+row*108;int focused_col=0;
+        for(col=0;col<20;col++){float x=28+col*(rows[row].item_w+rows[row].gap)-rows[row].offset;XeRect r={x,y,rows[row].item_w,78};float a;int focused;
+            focused=xe_ui_focusable(ids[row][col],r);a=xe_ui_focus_anim(ids[row][col]);if(focused)focused_col=col;
+            xe_r_rect((XeRect){r.x-3*a,r.y-3*a,r.w+6*a,r.h+6*a},10,(XeColor){.12f+.025f*(col%4),.15f+.018f*(row%4),.23f,1});
+            if(a>.01f)xe_r_border((XeRect){r.x-3*a,r.y-3*a,r.w+6*a,r.h+6*a},10,2.5f,(XeColor){1,.12f,.18f,a});}
+        xe_row_scroll_to(&rows[row],focused_col,(float)w-56);}
+    xe_ui_end();xe_r_end();acc+=dt;if(acc>=1){acc=0;printf("P7 frame dt=%.2f ms focus=%llu animations=%d\n",dt*1000,(unsigned long long)xe_ui_focus(),xe_anim_any_running());fflush(stdout);}
+}
+void xe_app_shutdown(void){}
+```
+
+### FILE: tests/p7_test_notes.txt
+```text
+- Displays 6 rows x 20 stable card IDs.
+- Arrow keys navigate using previous-frame rectangles and directional distance scoring.
+- Focus cards grow to a 1.08-equivalent size and draw a red border.
+- XeRow springs keep the selected card visible horizontally.
+- Frame delta time and focus ID print once per second.
+- Run inside the existing SDL2 or Android host after initializing P3.
+- P4 labels are not included in this interaction smoke test; screens can call xe_text_draw().
+```
+
+### FILE: CMakeLists_P7_integration.txt
+```text
+Add src/ui/anim.c and src/ui/ui.c to the xe static library source list.
+Ensure include/ is a public include directory. Compile tests/p7_test.c into the
+existing host test executable (the host must provide a GL context and call the
+xe_app_* lifecycle functions). Link libm on Unix-like platforms if required.
+```
+
+### SUMMARY
+```json
+{
+  "part": "P7",
+  "files": ["include/xe/anim.h", "src/ui/anim.c", "include/xe/ui.h", "src/ui/ui.c", "tests/p7_test.c", "tests/p7_test_notes.txt", "CMakeLists_P7_integration.txt"],
+  "public_api": [
+    "void xe_spring_init(XeSpring *s, float v, float stiffness, float damping)",
+    "void xe_spring_step(XeSpring *s, double dt)",
+    "int xe_spring_resting(const XeSpring *s)",
+    "float xe_ease_out_cubic(float t)",
+    "float xe_ease_in_out(float t)",
+    "float xe_tween_value(XeTween *t, double now)",
+    "int xe_anim_any_running(void)",
+    "XeId xe_id(const char *s)",
+    "XeId xe_id_mix(XeId a, long long n)",
+    "void xe_ui_begin(double dt, const XeEvent *events, int n)",
+    "void xe_ui_end(void)",
+    "int xe_ui_focusable(XeId id, XeRect r)",
+    "int xe_ui_activated(XeId id)",
+    "void xe_ui_set_focus(XeId id)",
+    "XeId xe_ui_focus(void)",
+    "float xe_ui_focus_anim(XeId id)",
+    "void xe_row_scroll_to(XeRow *row, int index, float view_w)",
+    "void xe_column_scroll_to(XeColumn *column, int index, float view_h)",
+    "void xe_ui_set_scroll_view(XeId id, XeRect viewport, float *offset, float content_extent, int vertical)",
+    "float xe_ui_pointer_scroll_delta(void)"
+  ],
+  "depends_on": ["P1 platform.h", "P3 render.h", "P4 text.h for screen labels"],
+  "assumptions": ["Targets are declared every frame; navigation uses previous-frame rectangles.", "Pointer coordinates and XeRect use the same logical coordinate space.", "Scroll view registration should be refreshed each frame; caller owns its offset."],
+  "not_done": ["Per-row remembered column focus is not a dedicated memory table; navigation uses spatial scoring.", "Inertial fling is not implemented; pointer drag and wheel scrolling are clamped.", "The smoke test requires an existing GL host and does not render text labels."],
+  "how_to_test": "Add src/ui/anim.c and src/ui/ui.c to xe and compile tests/p7_test.c into the existing GL host. Navigate the 6x20 grid with arrows; check focus scale, red border, horizontal scrolling and once-per-second frame timing."
+}
+```

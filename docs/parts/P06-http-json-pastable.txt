@@ -1,0 +1,998 @@
+XE P6 — HTTP AND JSON
+=====================
+
+This is a pasteable source bundle. Each section is a complete file. Add the files to the P1/P2/P3/P4/P5 repository and merge the CMake additions near the end into the existing root CMakeLists.txt. Do not replace the existing root CMakeLists.txt blindly: P1-P5 targets/options must be preserved.
+
+Dependencies (permissive licences only):
+- libcurl: https://curl.se/libcurl/ (curl licence). Build with HTTP/2 and Brotli support if desired; runtime requests gzip automatically and requests br only when libcurl reports Brotli support.
+- cJSON: https://github.com/DaveGamble/cJSON (MIT licence).
+- TLS trust: use the platform CA store where supported, or configure a CA bundle with xe_net_set_ca_bundle().
+
+Design notes:
+- A single worker owns one CURLM handle and performs all transfers. Up to eight transfers are active concurrently.
+- Callbacks are delivered only by xe_net_pump() on the thread that initialized the module. Response strings are valid only for the duration of the callback; copy them if needed.
+- Cancellation is best-effort for queued requests and uses libcurl's transfer-progress callback to abort active requests promptly. A completion callback is delivered with an error after cancellation.
+- xe_net_shutdown() stops the worker and drains pending callbacks before returning. Do not call shutdown from inside a response callback.
+- The cookie jar is stored as <data_dir>/xe-cookies.txt. Ensure data_dir exists and is writable. The jar is loaded/saved by libcurl; it is not an authentication vault.
+- DNS-over-HTTPS is configured through CURLOPT_DOH_URL where libcurl supports it. Unsupported builds simply ignore the setting and log a warning.
+- JSON builder values are escaped by cJSON; ownership rules are stated in the header.
+
+### FILE: include/xe/net.h
+```c
+#ifndef XE_NET_H
+#define XE_NET_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    int status;             /* HTTP status; 0 if no HTTP response was received */
+    char *body;             /* NUL-terminated, may contain embedded NULs; use len */
+    size_t len;
+    char *final_url;
+    char *content_type;
+    char *error;            /* NULL on success; owned by the response until callback returns */
+    double ms;              /* total transfer time in milliseconds */
+} XeHttpResponse;
+
+typedef void (*XeHttpCb)(const XeHttpResponse *res, void *user);
+
+void xe_net_init(void);
+void xe_net_shutdown(void);
+void xe_net_pump(void); /* call on the render/main thread; delivers completed callbacks */
+int xe_http_get(const char *url, const char *const *headers, XeHttpCb cb, void *user);
+int xe_http_post(const char *url, const char *const *headers,
+                 const void *body, size_t len, XeHttpCb cb, void *user);
+void xe_http_cancel(int id);
+void xe_net_set_user_agent(const char *ua);
+void xe_net_set_dns_over_https(const char *doh_url_or_null);
+void xe_net_set_ca_bundle(const char *path_or_null); /* Android: point at a readable PEM bundle */
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/json.h
+```c
+#ifndef XE_JSON_H
+#define XE_JSON_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Parse returns a cJSON object/array/value as void*. Release with xe_json_delete(). */
+void *xe_json_parse(const char *text, size_t len);
+void xe_json_delete(void *value);
+
+/* Path is dot-separated object keys, e.g. "meta.name". Returns a borrowed string. */
+const char *xe_json_str(const void *obj, const char *path);
+int xe_json_int(const void *obj, const char *path, int fallback);
+int xe_json_arr_len(const void *arr);
+void *xe_json_at(const void *arr, int index); /* borrowed child; do not delete */
+void *xe_json_obj_get(const void *obj, const char *key); /* borrowed child; do not delete */
+
+/* Small JSON object builder. Keys and values are copied by cJSON.
+   The returned builder is opaque. Nested builder APIs are intentionally omitted. */
+typedef struct XeJsonBuilder XeJsonBuilder;
+XeJsonBuilder *xe_json_builder_new(void);
+int xe_json_builder_string(XeJsonBuilder *b, const char *key, const char *value);
+int xe_json_builder_int(XeJsonBuilder *b, const char *key, int value);
+int xe_json_builder_double(XeJsonBuilder *b, const char *key, double value);
+int xe_json_builder_bool(XeJsonBuilder *b, const char *key, int value);
+int xe_json_builder_null(XeJsonBuilder *b, const char *key);
+char *xe_json_builder_finish(XeJsonBuilder *b); /* malloc-owned UTF-8 string; free() it */
+void xe_json_builder_free(XeJsonBuilder *b);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/net/net.c
+```c
+#include "xe/net.h"
+#include "xe/platform.h"
+
+#include <curl/curl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+typedef HANDLE XeThread;
+typedef CRITICAL_SECTION XeMutex;
+typedef CONDITION_VARIABLE XeCond;
+#  define xe_mutex_init(m) InitializeCriticalSection(m)
+#  define xe_mutex_destroy(m) DeleteCriticalSection(m)
+#  define xe_mutex_lock(m) EnterCriticalSection(m)
+#  define xe_mutex_unlock(m) LeaveCriticalSection(m)
+#  define xe_cond_init(c) InitializeConditionVariable(c)
+#  define xe_cond_signal(c) WakeConditionVariable(c)
+#  define xe_cond_broadcast(c) WakeAllConditionVariable(c)
+#  define xe_cond_wait(c,m) SleepConditionVariableCS(c,m,INFINITE)
+#else
+#  include <pthread.h>
+#  include <unistd.h>
+typedef pthread_t XeThread;
+typedef pthread_mutex_t XeMutex;
+typedef pthread_cond_t XeCond;
+#  define xe_mutex_init(m) pthread_mutex_init((m), NULL)
+#  define xe_mutex_destroy(m) pthread_mutex_destroy(m)
+#  define xe_mutex_lock(m) pthread_mutex_lock(m)
+#  define xe_mutex_unlock(m) pthread_mutex_unlock(m)
+#  define xe_cond_init(c) pthread_cond_init((c), NULL)
+#  define xe_cond_signal(c) pthread_cond_signal(c)
+#  define xe_cond_broadcast(c) pthread_cond_broadcast(c)
+#  define xe_cond_wait(c,m) pthread_cond_wait((c),(m))
+#endif
+
+#define XE_NET_MAX_ACTIVE 8
+#define XE_NET_MAX_BODY (32u * 1024u * 1024u)
+#define XE_NET_TIMEOUT_SECONDS 20L
+
+typedef enum { REQ_GET, REQ_POST } ReqMethod;
+typedef struct XeRequest {
+    int id;
+    ReqMethod method;
+    char *url;
+    char **headers;
+    size_t header_count;
+    unsigned char *post_body;
+    size_t post_len;
+    XeHttpCb cb;
+    void *user;
+    int cancelled;
+    int started;
+    CURL *easy;
+    struct curl_slist *curl_headers;
+    char *body;
+    size_t body_len;
+    size_t body_cap;
+    char *content_type;
+    char *error;
+    double started_at;
+    struct XeRequest *next;
+    struct XeRequest *active_next;
+} XeRequest;
+
+typedef struct XeDone {
+    XeRequest *req;
+    int status;
+    char *final_url;
+    double ms;
+    struct XeDone *next;
+} XeDone;
+
+static struct {
+    int initialized;
+    int stopping;
+    int next_id;
+    XeMutex mutex;
+    XeCond cond;
+    XeThread thread;
+    XeRequest *pending_head, *pending_tail;
+    XeRequest *active_head;
+    XeDone *done_head, *done_tail;
+    int active_count;
+    char *user_agent;
+    char *doh_url;
+    char *ca_bundle;
+    char *cookie_path;
+    CURLM *multi;
+} g_net;
+
+static double monotonic_seconds(void) {
+#if defined(_WIN32)
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+#  if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#  else
+    timespec_get(&ts, TIME_UTC);
+#  endif
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+#endif
+}
+
+static char *dupstr(const char *s) {
+    size_t n;
+    char *p;
+    if (!s) return NULL;
+    n = strlen(s) + 1;
+    p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+static void req_free(XeRequest *r) {
+    size_t i;
+    if (!r) return;
+    if (r->easy) curl_easy_cleanup(r->easy);
+    if (r->curl_headers) curl_slist_free_all(r->curl_headers);
+    for (i = 0; i < r->header_count; ++i) free(r->headers[i]);
+    free(r->headers);
+    free(r->url);
+    free(r->post_body);
+    free(r->body);
+    free(r->content_type);
+    free(r->error);
+    free(r);
+}
+
+static void done_push(XeRequest *r, int status, char *final_url) {
+    XeDone *d = (XeDone *)calloc(1, sizeof(*d));
+    if (!d) {
+        r->error = dupstr("out of memory queuing HTTP completion");
+        free(final_url);
+        req_free(r);
+        return;
+    }
+    d->req = r;
+    d->status = status;
+    d->final_url = final_url;
+    d->ms = (monotonic_seconds() - r->started_at) * 1000.0;
+    xe_mutex_lock(&g_net.mutex);
+    if (g_net.done_tail) g_net.done_tail->next = d;
+    else g_net.done_head = d;
+    g_net.done_tail = d;
+    xe_mutex_unlock(&g_net.mutex);
+}
+
+static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    XeRequest *r = (XeRequest *)userdata;
+    size_t n;
+    char *p;
+    if (size && nmemb > SIZE_MAX / size) return 0;
+    n = size * nmemb;
+    if (n > XE_NET_MAX_BODY || r->body_len > XE_NET_MAX_BODY - n) {
+        if (!r->error) r->error = dupstr("response body exceeds 32 MiB safety limit");
+        return 0;
+    }
+    if (r->body_len + n + 1 > r->body_cap) {
+        size_t cap = r->body_cap ? r->body_cap : 4096;
+        while (cap < r->body_len + n + 1) {
+            if (cap > XE_NET_MAX_BODY / 2) { cap = XE_NET_MAX_BODY + 1; break; }
+            cap *= 2;
+        }
+        p = (char *)realloc(r->body, cap);
+        if (!p) { if (!r->error) r->error = dupstr("out of memory reading response"); return 0; }
+        r->body = p; r->body_cap = cap;
+    }
+    memcpy(r->body + r->body_len, ptr, n);
+    r->body_len += n;
+    r->body[r->body_len] = '\0';
+    return n;
+}
+
+/* Portable case-insensitive prefix check (avoids platform-specific strncasecmp). */
+static int ascii_ncasecmp(const char *a, const char *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') x = (unsigned char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (unsigned char)(y + 32);
+        if (x != y) return (int)x - (int)y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+
+static size_t header_cb_portable(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    XeRequest *r = (XeRequest *)userdata;
+    size_t n = size * nmemb;
+    static const char prefix[] = "Content-Type:";
+    if (n >= sizeof(prefix)-1 && ascii_ncasecmp(ptr, prefix, sizeof(prefix)-1) == 0) {
+        const char *s = ptr + sizeof(prefix)-1;
+        size_t len;
+        while ((size_t)(s-ptr) < n && (*s == ' ' || *s == '\t')) ++s;
+        len = n - (size_t)(s-ptr);
+        while (len && (s[len-1] == '\r' || s[len-1] == '\n' || s[len-1] == ' ' || s[len-1] == '\t')) --len;
+        if (len) {
+            char *v = (char *)malloc(len+1);
+            if (v) { memcpy(v, s, len); v[len] = 0; free(r->content_type); r->content_type = v; }
+        }
+    }
+    return n;
+}
+
+static int progress_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow) {
+    XeRequest *r = (XeRequest *)userdata;
+    int cancelled;
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    xe_mutex_lock(&g_net.mutex);
+    cancelled = r->cancelled || g_net.stopping;
+    xe_mutex_unlock(&g_net.mutex);
+    return cancelled ? 1 : 0;
+}
+
+static void active_remove_locked(XeRequest *r) {
+    XeRequest **pp = &g_net.active_head;
+    while (*pp) {
+        if (*pp == r) { *pp = r->active_next; r->active_next = NULL; return; }
+        pp = &(*pp)->active_next;
+    }
+}
+
+static void set_easy_options(XeRequest *r) {
+    size_t i;
+    CURLcode rc;
+    r->easy = curl_easy_init();
+    if (!r->easy) { r->error = dupstr("curl_easy_init failed"); return; }
+    for (i = 0; i < r->header_count; ++i) {
+        struct curl_slist *h = curl_slist_append(r->curl_headers, r->headers[i]);
+        if (h) r->curl_headers = h;
+    }
+    curl_easy_setopt(r->easy, CURLOPT_URL, r->url);
+    curl_easy_setopt(r->easy, CURLOPT_PRIVATE, r);
+    curl_easy_setopt(r->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(r->easy, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(r->easy, CURLOPT_CONNECTTIMEOUT, XE_NET_TIMEOUT_SECONDS);
+    curl_easy_setopt(r->easy, CURLOPT_TIMEOUT, XE_NET_TIMEOUT_SECONDS);
+    curl_easy_setopt(r->easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(r->easy, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(r->easy, CURLOPT_XFERINFOFUNCTION, progress_cb);
+    curl_easy_setopt(r->easy, CURLOPT_XFERINFODATA, r);
+    curl_easy_setopt(r->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(r->easy, CURLOPT_ACCEPT_ENCODING, ""); /* gzip/deflate; br if built into curl */
+    curl_easy_setopt(r->easy, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(r->easy, CURLOPT_WRITEDATA, r);
+    curl_easy_setopt(r->easy, CURLOPT_HEADERFUNCTION, header_cb_portable);
+    curl_easy_setopt(r->easy, CURLOPT_HEADERDATA, r);
+    curl_easy_setopt(r->easy, CURLOPT_USERAGENT, g_net.user_agent ? g_net.user_agent : "XE/1.0");
+    curl_easy_setopt(r->easy, CURLOPT_HTTPHEADER, r->curl_headers);
+    curl_easy_setopt(r->easy, CURLOPT_COOKIEFILE, g_net.cookie_path ? g_net.cookie_path : "");
+    curl_easy_setopt(r->easy, CURLOPT_COOKIEJAR, g_net.cookie_path ? g_net.cookie_path : NULL);
+#ifdef CURLOPT_DOH_URL
+    if (g_net.doh_url && *g_net.doh_url) curl_easy_setopt(r->easy, CURLOPT_DOH_URL, g_net.doh_url);
+#else
+    if (g_net.doh_url && *g_net.doh_url) xe_log(2, "libcurl built without CURLOPT_DOH_URL support");
+#endif
+    if (g_net.ca_bundle && *g_net.ca_bundle) curl_easy_setopt(r->easy, CURLOPT_CAINFO, g_net.ca_bundle);
+#if LIBCURL_VERSION_NUM >= 0x072F00
+    curl_easy_setopt(r->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+#endif
+    if (r->method == REQ_POST) {
+        curl_easy_setopt(r->easy, CURLOPT_POST, 1L);
+        curl_easy_setopt(r->easy, CURLOPT_POSTFIELDS, r->post_body ? (const char *)r->post_body : "");
+        curl_easy_setopt(r->easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)r->post_len);
+    }
+    rc = curl_easy_setopt(r->easy, CURLOPT_PRIVATE, r);
+    (void)rc;
+}
+
+static void remove_pending_cancelled(void) {
+    XeRequest **pp, *r;
+    xe_mutex_lock(&g_net.mutex);
+    pp = &g_net.pending_head;
+    while ((r = *pp) != NULL) {
+        if (r->cancelled) {
+            *pp = r->next;
+            if (g_net.pending_tail == r) g_net.pending_tail = NULL;
+            r->error = dupstr("request cancelled");
+            r->started_at = monotonic_seconds();
+            r->next = NULL;
+            xe_mutex_unlock(&g_net.mutex);
+            done_push(r, 0, dupstr(r->url));
+            xe_mutex_lock(&g_net.mutex);
+            pp = &g_net.pending_head;
+        } else pp = &r->next;
+    }
+    if (!g_net.pending_head) g_net.pending_tail = NULL;
+    else if (!g_net.pending_tail) { XeRequest *t = g_net.pending_head; while (t->next) t=t->next; g_net.pending_tail=t; }
+    xe_mutex_unlock(&g_net.mutex);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI net_worker(LPVOID unused)
+#else
+static void *net_worker(void *unused)
+#endif
+{
+    (void)unused;
+    g_net.multi = curl_multi_init();
+    if (!g_net.multi) {
+        xe_log(3, "curl_multi_init failed");
+        xe_mutex_lock(&g_net.mutex); g_net.stopping = 1; xe_cond_broadcast(&g_net.cond); xe_mutex_unlock(&g_net.mutex);
+#if defined(_WIN32)
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+    for (;;) {
+        int running = 0, msgs = 0;
+        CURLMsg *msg;
+        remove_pending_cancelled();
+        xe_mutex_lock(&g_net.mutex);
+        while (g_net.pending_head && g_net.active_count < XE_NET_MAX_ACTIVE) {
+            XeRequest *r = g_net.pending_head;
+            g_net.pending_head = r->next;
+            if (!g_net.pending_head) g_net.pending_tail = NULL;
+            r->next = NULL;
+            if (r->cancelled) {
+                r->error = dupstr("request cancelled");
+                r->started_at = monotonic_seconds();
+                xe_mutex_unlock(&g_net.mutex); done_push(r, 0, dupstr(r->url)); xe_mutex_lock(&g_net.mutex);
+                continue;
+            }
+            r->started = 1; r->started_at = monotonic_seconds();
+            xe_mutex_unlock(&g_net.mutex);
+            set_easy_options(r);
+            if (!r->easy || r->error) {
+                xe_mutex_lock(&g_net.mutex); xe_mutex_unlock(&g_net.mutex);
+                done_push(r, 0, dupstr(r->url));
+                xe_mutex_lock(&g_net.mutex);
+                continue;
+            }
+            curl_multi_add_handle(g_net.multi, r->easy);
+            xe_mutex_lock(&g_net.mutex);
+            r->active_next = g_net.active_head;
+            g_net.active_head = r;
+            ++g_net.active_count;
+            xe_mutex_unlock(&g_net.mutex);
+            xe_mutex_lock(&g_net.mutex);
+        }
+        if (g_net.stopping && g_net.active_count == 0 && !g_net.pending_head) {
+            xe_mutex_unlock(&g_net.mutex);
+            break;
+        }
+        xe_mutex_unlock(&g_net.mutex);
+
+        /* Cancellation is inspected between short multi polls, keeping shutdown responsive. */
+        curl_multi_perform(g_net.multi, &running);
+        curl_multi_poll(g_net.multi, NULL, 0, 50, NULL);
+        curl_multi_perform(g_net.multi, &running);
+
+        while ((msg = curl_multi_info_read(g_net.multi, &msgs)) != NULL) {
+            if (msg->msg == CURLMSG_DONE) {
+                XeRequest *r = NULL;
+                long status = 0;
+                char *final_url = NULL;
+                curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &r);
+                curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &status);
+                { char *u = NULL; if (curl_easy_getinfo(msg->easy_handle, CURLINFO_EFFECTIVE_URL, &u) == CURLE_OK && u) final_url = dupstr(u); }
+                if (r) {
+                    xe_mutex_lock(&g_net.mutex);
+                    active_remove_locked(r);
+                    if (g_net.active_count > 0) --g_net.active_count;
+                    if (r->cancelled && !r->error) r->error = dupstr("request cancelled");
+                    xe_mutex_unlock(&g_net.mutex);
+                    if (msg->data.result != CURLE_OK && !r->error) r->error = dupstr(curl_easy_strerror(msg->data.result));
+                    curl_multi_remove_handle(g_net.multi, msg->easy_handle);
+                    done_push(r, (int)status, final_url ? final_url : dupstr(r->url));
+                } else free(final_url);
+                curl_multi_remove_handle(g_net.multi, msg->easy_handle);
+            }
+        }
+
+        /* Abort active transfers requested by xe_http_cancel(). */
+        {
+            CURLM *m = g_net.multi;
+            (void)m;
+            /* We track active requests through CURLINFO_PRIVATE by walking handles. */
+            CURL *easy = NULL;
+            (void)easy;
+            /* curl_multi has no public iterator in older releases; cancellation is also
+               checked by the progress callback below in builds where supported. */
+        }
+        xe_mutex_lock(&g_net.mutex);
+        if (!g_net.stopping && !g_net.pending_head && g_net.active_count == 0)
+            xe_cond_wait(&g_net.cond, &g_net.mutex);
+        xe_mutex_unlock(&g_net.mutex);
+    }
+    curl_multi_cleanup(g_net.multi);
+    g_net.multi = NULL;
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static XeRequest *request_new(ReqMethod method, const char *url, const char *const *headers,
+                              const void *body, size_t len, XeHttpCb cb, void *user) {
+    XeRequest *r;
+    size_t n = 0, i;
+    if (!url || !*url || !cb || (method == REQ_POST && len && !body)) return NULL;
+    r = (XeRequest *)calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->method = method; r->url = dupstr(url); r->cb = cb; r->user = user;
+    if (!r->url) { req_free(r); return NULL; }
+    if (headers) { while (headers[n]) ++n; }
+    if (n) {
+        r->headers = (char **)calloc(n, sizeof(char *));
+        if (!r->headers) { req_free(r); return NULL; }
+        for (i=0; i<n; ++i) {
+            r->headers[i] = dupstr(headers[i]);
+            if (!r->headers[i]) { r->header_count = i; req_free(r); return NULL; }
+            r->header_count++;
+        }
+    }
+    if (method == REQ_POST && len) {
+        r->post_body = (unsigned char *)malloc(len);
+        if (!r->post_body) { req_free(r); return NULL; }
+        memcpy(r->post_body, body, len); r->post_len = len;
+    }
+    return r;
+}
+
+void xe_net_init(void) {
+    const char *data;
+    if (g_net.initialized) return;
+    memset(&g_net, 0, sizeof(g_net));
+    xe_mutex_init(&g_net.mutex); xe_cond_init(&g_net.cond);
+    g_net.next_id = 1;
+    g_net.user_agent = dupstr("XE/1.0");
+    data = xe_platform_data_dir();
+    if (data && *data) {
+        size_t n = strlen(data) + 32;
+        g_net.cookie_path = (char *)malloc(n);
+        if (g_net.cookie_path) snprintf(g_net.cookie_path, n, "%s/%s", data, "xe-cookies.txt");
+    }
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        xe_log(3, "curl_global_init failed");
+        free(g_net.user_agent); free(g_net.cookie_path);
+        xe_cond_destroy(&g_net.cond); xe_mutex_destroy(&g_net.mutex); memset(&g_net,0,sizeof(g_net)); return;
+    }
+#if defined(_WIN32)
+    g_net.thread = CreateThread(NULL, 0, net_worker, NULL, 0, NULL);
+    if (!g_net.thread) { curl_global_cleanup(); xe_log(3, "failed to start network worker"); return; }
+#else
+    if (pthread_create(&g_net.thread, NULL, net_worker, NULL) != 0) {
+        curl_global_cleanup(); xe_log(3, "failed to start network worker"); return;
+    }
+#endif
+    g_net.initialized = 1;
+}
+
+static int submit_request(XeRequest *r) {
+    if (!r || !g_net.initialized) { req_free(r); return 0; }
+    xe_mutex_lock(&g_net.mutex);
+    r->id = g_net.next_id++;
+    if (g_net.next_id <= 0) g_net.next_id = 1;
+    if (g_net.pending_tail) g_net.pending_tail->next = r; else g_net.pending_head = r;
+    g_net.pending_tail = r;
+    xe_cond_signal(&g_net.cond);
+    xe_mutex_unlock(&g_net.mutex);
+    return r->id;
+}
+
+int xe_http_get(const char *url, const char *const *headers, XeHttpCb cb, void *user) {
+    return submit_request(request_new(REQ_GET, url, headers, NULL, 0, cb, user));
+}
+int xe_http_post(const char *url, const char *const *headers, const void *body, size_t len, XeHttpCb cb, void *user) {
+    return submit_request(request_new(REQ_POST, url, headers, body, len, cb, user));
+}
+
+void xe_http_cancel(int id) {
+    XeRequest *r;
+    if (!g_net.initialized || id <= 0) return;
+    xe_mutex_lock(&g_net.mutex);
+    for (r = g_net.pending_head; r; r = r->next) if (r->id == id) r->cancelled = 1;
+    for (r = g_net.active_head; r; r = r->active_next) if (r->id == id) r->cancelled = 1;
+    xe_cond_signal(&g_net.cond);
+    xe_mutex_unlock(&g_net.mutex);
+}
+
+void xe_net_set_user_agent(const char *ua) {
+    char *copy = dupstr(ua && *ua ? ua : "XE/1.0");
+    if (!copy) return;
+    xe_mutex_lock(&g_net.mutex); free(g_net.user_agent); g_net.user_agent = copy; xe_cond_signal(&g_net.cond); xe_mutex_unlock(&g_net.mutex);
+}
+void xe_net_set_dns_over_https(const char *url) {
+    char *copy = dupstr(url && *url ? url : NULL);
+    xe_mutex_lock(&g_net.mutex); free(g_net.doh_url); g_net.doh_url = copy; xe_cond_signal(&g_net.cond); xe_mutex_unlock(&g_net.mutex);
+}
+void xe_net_set_ca_bundle(const char *path) {
+    char *copy = dupstr(path && *path ? path : NULL);
+    xe_mutex_lock(&g_net.mutex); free(g_net.ca_bundle); g_net.ca_bundle = copy; xe_cond_signal(&g_net.cond); xe_mutex_unlock(&g_net.mutex);
+}
+
+void xe_net_pump(void) {
+    double start = monotonic_seconds();
+    const double budget = 0.002; /* ~2 ms callback budget; at least one completion is delivered. */
+    if (!g_net.initialized) return;
+    for (;;) {
+        XeDone *d;
+        XeRequest *saved_req;
+        XeHttpResponse res;
+        xe_mutex_lock(&g_net.mutex);
+        d = g_net.done_head;
+        if (d) {
+            g_net.done_head = d->next;
+            if (!g_net.done_head) g_net.done_tail = NULL;
+        }
+        xe_mutex_unlock(&g_net.mutex);
+        if (!d) break;
+        saved_req = d->req;
+        memset(&res, 0, sizeof(res));
+        res.status = d->status;
+        res.body = saved_req->body;
+        res.len = saved_req->body_len;
+        res.final_url = d->final_url;
+        res.content_type = saved_req->content_type;
+        res.error = saved_req->error;
+        res.ms = d->ms;
+        saved_req->cb(&res, saved_req->user);
+        free(d->final_url); free(d);
+        req_free(saved_req);
+        if (monotonic_seconds() - start >= budget) break;
+    }
+}
+
+void xe_net_shutdown(void) {
+    XeRequest *r, *next;
+    XeDone *d, *dn;
+    if (!g_net.initialized) return;
+    xe_mutex_lock(&g_net.mutex); g_net.stopping = 1; xe_cond_broadcast(&g_net.cond); xe_mutex_unlock(&g_net.mutex);
+#if defined(_WIN32)
+    WaitForSingleObject(g_net.thread, INFINITE); CloseHandle(g_net.thread);
+#else
+    pthread_join(g_net.thread, NULL);
+#endif
+    /* Deliver final completions while callback target is still valid. */
+    for (;;) {
+        xe_mutex_lock(&g_net.mutex); d = g_net.done_head;
+        if (d) { g_net.done_head = d->next; if (!g_net.done_head) g_net.done_tail = NULL; }
+        xe_mutex_unlock(&g_net.mutex);
+        if (!d) break;
+        { XeHttpResponse res; XeRequest *q = d->req; memset(&res,0,sizeof(res));
+          res.status=d->status; res.body=q->body; res.len=q->body_len; res.final_url=d->final_url;
+          res.content_type=q->content_type; res.error=q->error; res.ms=d->ms; q->cb(&res,q->user);
+          free(d->final_url); free(d); req_free(q); }
+    }
+    r = g_net.pending_head; while (r) { next=r->next; req_free(r); r=next; }
+    free(g_net.user_agent); free(g_net.doh_url); free(g_net.ca_bundle); free(g_net.cookie_path);
+    curl_global_cleanup(); xe_cond_destroy(&g_net.cond); xe_mutex_destroy(&g_net.mutex);
+    memset(&g_net, 0, sizeof(g_net));
+}
+```
+
+### FILE: src/json/json.c
+```c
+#include "xe/json.h"
+#include <cJSON.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct XeJsonBuilder { cJSON *root; };
+
+void *xe_json_parse(const char *text, size_t len) {
+    const char *end;
+    if (!text) return NULL;
+    end = text + len;
+    return cJSON_ParseWithLengthOpts(text, len, &end, 0);
+}
+void xe_json_delete(void *value) { cJSON_Delete((cJSON *)value); }
+
+static const cJSON *path_get(const cJSON *obj, const char *path) {
+    const cJSON *cur = obj;
+    const char *p = path;
+    char key[256];
+    if (!path || !*path) return cur;
+    while (*p && cur) {
+        size_t n = 0;
+        while (*p && *p != '.') {
+            if (n + 1 < sizeof(key)) key[n++] = *p;
+            ++p;
+        }
+        key[n] = '\0';
+        if (*p == '.') ++p;
+        if (!cJSON_IsObject(cur)) return NULL;
+        cur = cJSON_GetObjectItemCaseSensitive((cJSON *)cur, key);
+    }
+    return cur;
+}
+const char *xe_json_str(const void *obj, const char *path) {
+    const cJSON *v = path_get((const cJSON *)obj, path);
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+int xe_json_int(const void *obj, const char *path, int fallback) {
+    const cJSON *v = path_get((const cJSON *)obj, path);
+    if (cJSON_IsNumber(v)) return v->valueint;
+    if (cJSON_IsBool(v)) return cJSON_IsTrue(v) ? 1 : 0;
+    return fallback;
+}
+int xe_json_arr_len(const void *arr) {
+    return cJSON_IsArray((const cJSON *)arr) ? cJSON_GetArraySize((const cJSON *)arr) : 0;
+}
+void *xe_json_at(const void *arr, int index) {
+    if (index < 0 || !cJSON_IsArray((const cJSON *)arr)) return NULL;
+    return cJSON_GetArrayItem((cJSON *)arr, index);
+}
+void *xe_json_obj_get(const void *obj, const char *key) {
+    if (!key || !cJSON_IsObject((const cJSON *)obj)) return NULL;
+    return cJSON_GetObjectItemCaseSensitive((cJSON *)obj, key);
+}
+
+XeJsonBuilder *xe_json_builder_new(void) {
+    XeJsonBuilder *b = (XeJsonBuilder *)calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    b->root = cJSON_CreateObject();
+    if (!b->root) { free(b); return NULL; }
+    return b;
+}
+static int add_item(XeJsonBuilder *b, const char *key, cJSON *item) {
+    if (!b || !b->root || !key || !*key || !item) { cJSON_Delete(item); return 0; }
+    if (!cJSON_AddItemToObject(b->root, key, item)) { cJSON_Delete(item); return 0; }
+    return 1;
+}
+int xe_json_builder_string(XeJsonBuilder *b, const char *key, const char *value) {
+    return add_item(b, key, value ? cJSON_CreateString(value) : cJSON_CreateNull());
+}
+int xe_json_builder_int(XeJsonBuilder *b, const char *key, int value) {
+    return add_item(b, key, cJSON_CreateNumber((double)value));
+}
+int xe_json_builder_double(XeJsonBuilder *b, const char *key, double value) {
+    return add_item(b, key, cJSON_CreateNumber(value));
+}
+int xe_json_builder_bool(XeJsonBuilder *b, const char *key, int value) {
+    return add_item(b, key, cJSON_CreateBool(value != 0));
+}
+int xe_json_builder_null(XeJsonBuilder *b, const char *key) {
+    return add_item(b, key, cJSON_CreateNull());
+}
+char *xe_json_builder_finish(XeJsonBuilder *b) {
+    char *out;
+    if (!b || !b->root) return NULL;
+    out = cJSON_PrintUnformatted(b->root);
+    return out; /* caller frees with free() */
+}
+void xe_json_builder_free(XeJsonBuilder *b) {
+    if (!b) return;
+    cJSON_Delete(b->root); free(b);
+}
+```
+
+### FILE: tests/p6_test.c
+```c
+#include "xe/net.h"
+#include "xe/json.h"
+#include "xe/platform.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
+
+static int finished;
+static void manifest_cb(const XeHttpResponse *res, void *user) {
+    int i, n;
+    void *json;
+    (void)user;
+    printf("HTTP status: %d, bytes: %zu, time: %.1f ms\n", res->status, res->len, res->ms);
+    if (res->error) fprintf(stderr, "HTTP error: %s\n", res->error);
+    if (!res->body || res->status < 200 || res->status >= 300) { finished = 1; return; }
+    json = xe_json_parse(res->body, res->len);
+    if (!json) { fprintf(stderr, "Invalid manifest JSON\n"); finished = 1; return; }
+    {
+        const char *name = xe_json_str(json, "name");
+        if (name) printf("Addon: %s\n", name);
+    }
+    {
+        void *resources = xe_json_obj_get(json, "resources");
+        int ri, rn = xe_json_arr_len(resources);
+        for (ri = 0; ri < rn; ++ri) {
+            void *resource = xe_json_at(resources, ri);
+            void *cats = xe_json_obj_get(resource, "catalogs");
+            n = xe_json_arr_len(cats);
+            for (i = 0; i < n; ++i) {
+                void *cat = xe_json_at(cats, i);
+                const char *title = xe_json_str(cat, "name");
+                if (title) printf("Catalog: %s\n", title);
+            }
+        }
+    }
+    xe_json_delete(json);
+    finished = 1;
+}
+
+/* P1 default app lifecycle definitions for a standalone host/test build. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) int xe_app_init(void) { return 1; }
+__attribute__((weak)) void xe_app_frame(double dt) { (void)dt; }
+__attribute__((weak)) void xe_app_shutdown(void) {}
+#endif
+
+int main(void) {
+    xe_net_init();
+    if (!xe_http_get("https://v3-cinemeta.strem.io/manifest.json", NULL, manifest_cb, NULL)) {
+        fprintf(stderr, "Could not queue manifest request (network module not initialized?)\n");
+        xe_net_shutdown(); return 1;
+    }
+    while (!finished) {
+        xe_net_pump();
+#if defined(_WIN32)
+        Sleep(1);
+#else
+        { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 1000000L; nanosleep(&ts, NULL); }
+#endif
+    }
+    xe_net_shutdown();
+    return 0;
+}
+```
+
+### FILE: CMakeLists.txt — P6 additions to merge into the existing root file
+```cmake
+# Preserve all existing P1-P5 options and targets. Add these lines after xe is defined.
+option(XE_WITH_CURL "Build HTTP module with libcurl" ON)
+option(XE_WITH_CJSON "Build JSON helpers with cJSON" ON)
+
+if(XE_WITH_CURL)
+    find_package(CURL REQUIRED)
+    target_sources(xe PRIVATE src/net/net.c)
+    target_link_libraries(xe PUBLIC CURL::libcurl)
+    target_compile_definitions(xe PRIVATE XE_WITH_CURL=1)
+endif()
+
+if(XE_WITH_CJSON)
+    find_package(cJSON CONFIG QUIET)
+    if(TARGET cjson)
+        target_sources(xe PRIVATE src/json/json.c)
+        target_link_libraries(xe PUBLIC cjson)
+    elseif(TARGET cJSON::cJSON)
+        target_sources(xe PRIVATE src/json/json.c)
+        target_link_libraries(xe PUBLIC cJSON::cJSON)
+    else()
+        message(FATAL_ERROR "cJSON package not found. Provide cJSONConfig.cmake or add cJSON as a subdirectory.")
+    endif()
+endif()
+
+option(XE_BUILD_P6_TEST "Build the P6 HTTP/JSON test" OFF)
+if(XE_BUILD_P6_TEST)
+    add_executable(xe_p6_test tests/p6_test.c)
+    target_link_libraries(xe_p6_test PRIVATE xe)
+endif()
+```
+
+### FILE: third_party/P6_DEPENDENCIES.md
+```text
+P6 dependencies
+===============
+
+libcurl
+- Official source: https://curl.se/libcurl/
+- Licence: curl licence (permissive; MIT-like)
+- Needed features: HTTPS/TLS, HTTP/2 where available, cookie engine, compression.
+- Brotli is negotiated automatically only when libcurl was built with Brotli support.
+- Windows TLS may use Schannel depending on the chosen build; Android should use a trusted CA bundle or supported platform CA configuration.
+
+cJSON
+- Official source: https://github.com/DaveGamble/cJSON
+- Licence: MIT
+- Build as a shared/static dependency or add its source directory through CMake. Do not vendor generated binaries into this module.
+
+No GPL code is included in this P6 source bundle.
+```
+
+### SUMMARY
+```json
+{
+  "part": "P6",
+  "files": [
+    "include/xe/net.h",
+    "include/xe/json.h",
+    "src/net/net.c",
+    "src/json/json.c",
+    "tests/p6_test.c",
+    "CMakeLists.txt (P6 additions to merge)",
+    "third_party/P6_DEPENDENCIES.md"
+  ],
+  "public_api": [
+    "void xe_net_init(void)",
+    "void xe_net_shutdown(void)",
+    "void xe_net_pump(void)",
+    "int xe_http_get(const char *url, const char *const *headers, XeHttpCb cb, void *user)",
+    "int xe_http_post(const char *url, const char *const *headers, const void *body, size_t len, XeHttpCb cb, void *user)",
+    "void xe_http_cancel(int id)",
+    "void xe_net_set_user_agent(const char *ua)",
+    "void xe_net_set_dns_over_https(const char *doh_url_or_null)",
+    "void xe_net_set_ca_bundle(const char *path_or_null)",
+    "void *xe_json_parse(const char *text, size_t len)",
+    "void xe_json_delete(void *value)",
+    "const char *xe_json_str(const void *obj, const char *path)",
+    "int xe_json_int(const void *obj, const char *path, int fallback)",
+    "int xe_json_arr_len(const void *arr)",
+    "void *xe_json_at(const void *arr, int index)",
+    "void *xe_json_obj_get(const void *obj, const char *key)",
+    "XeJsonBuilder *xe_json_builder_new(void)",
+    "int xe_json_builder_string(XeJsonBuilder *b, const char *key, const char *value)",
+    "int xe_json_builder_int(XeJsonBuilder *b, const char *key, int value)",
+    "int xe_json_builder_double(XeJsonBuilder *b, const char *key, double value)",
+    "int xe_json_builder_bool(XeJsonBuilder *b, const char *key, int value)",
+    "int xe_json_builder_null(XeJsonBuilder *b, const char *key)",
+    "char *xe_json_builder_finish(XeJsonBuilder *b)",
+    "void xe_json_builder_free(XeJsonBuilder *b)"
+  ],
+  "depends_on": ["P1 platform.h", "libcurl", "cJSON"],
+  "assumptions": [
+    "The existing P1-P5 CMake project is preserved and the listed P6 CMake additions are merged into it.",
+    "libcurl is built with TLS; HTTP/2 and Brotli depend on the selected libcurl build.",
+    "The caller invokes xe_net_pump on the render thread and copies response fields it needs to retain.",
+    "The data directory exists and is writable if persistent cookies are required."
+  ],
+  "not_done": [
+    "This bundle has not been compiled or runtime-tested in this environment.",
+    "Cookie jar directory creation is left to the host/application.",
+    "The 2 ms pump budget is approximate and cannot preempt a callback that itself runs longer than the budget."
+  ],
+  "how_to_test": "Merge the P6 CMake additions, configure with libcurl and cJSON development packages installed, enable XE_BUILD_P6_TEST, build xe_p6_test, then run it with network access. It requests https://v3-cinemeta.strem.io/manifest.json and prints the addon name and catalog names."
+}
+```
+
+IMPORTANT VALIDATION NOTE
+-------------------------
+This source bundle has not been compiled or runtime-tested here. Compile with warnings enabled and run ASan/TSan where available before production use. The worker lifecycle and platform-specific toolchain integration should be reviewed carefully when merging into the existing P1-P5 tree.
+
+### FILE: include/xe/platform.h (P1 dependency reference; do not duplicate if already present)
+```c
+#ifndef XE_PLATFORM_H
+#define XE_PLATFORM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    XE_KEY_NONE, XE_KEY_UP, XE_KEY_DOWN, XE_KEY_LEFT, XE_KEY_RIGHT, XE_KEY_OK,
+    XE_KEY_BACK, XE_KEY_MENU, XE_KEY_PLAYPAUSE, XE_KEY_FF, XE_KEY_RW, XE_KEY_SEARCH
+} XeKey;
+
+typedef enum {
+    XE_EV_NONE, XE_EV_KEY_DOWN, XE_EV_KEY_UP, XE_EV_TEXT, XE_EV_POINTER_DOWN,
+    XE_EV_POINTER_MOVE, XE_EV_POINTER_UP, XE_EV_SCROLL, XE_EV_RESIZE, XE_EV_PAUSE,
+    XE_EV_RESUME, XE_EV_QUIT
+} XeEventType;
+
+typedef struct {
+    XeEventType type;
+    XeKey key;
+    int repeat;
+    unsigned codepoint;
+    float x, y, dx, dy;
+    int w, h;
+} XeEvent;
+
+void xe_platform_push_event(const XeEvent *ev);
+int xe_platform_poll(XeEvent *out);
+double xe_time_now(void);
+void xe_platform_set_size(int w, int h, float density);
+void xe_platform_size(int *w, int *h, float *density);
+void xe_platform_set_dirs(const char *data_dir, const char *cache_dir);
+const char *xe_platform_data_dir(void);
+const char *xe_platform_cache_dir(void);
+void xe_log(int level, const char *fmt, ...);
+int xe_app_init(void);
+void xe_app_frame(double dt);
+void xe_app_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```

@@ -1,0 +1,229 @@
+XE P4 — TEXT ENGINE IMPLEMENTATION BUNDLE
+========================================
+
+This is a single pasteable text bundle, not a ZIP. Create the files using the FILE sections below.
+P3 dependency: include/xe/render.h (its exact contents are repeated at the end of this file).
+Dependencies: FreeType 2 and HarfBuzz (with hb-ft integration). On Android, build both as native dependencies and link them into xe. On Windows, use CMake package targets or imported targets supplied by your dependency manager. Do not copy dependency source into this project unless you intentionally vendor it and preserve its licences.
+
+IMPORTANT IMPLEMENTATION NOTES
+------------------------------
+- Font shaping is done with HarfBuzz; glyph rasterization/metrics come from FreeType.
+- Font fallback is selected per Unicode code point before shaping contiguous runs. For complex scripts, keep each script run together; fallback selection must not split a conjunct/cluster. This implementation uses a conservative per-codepoint fallback choice and is a good P4 base, but should be upgraded to cluster-aware fallback before production.
+- The glyph atlas is RGBA8 because P3's xe_tex_create/xe_tex_update API accepts RGBA pixels. Glyph coverage is stored in the alpha channel.
+- Atlas eviction is LRU. When full, the atlas is cleared and glyph records are invalidated (safe but can cause repacking churn); the cache does not evict individual packed rectangles because doing so safely requires a free-rectangle allocator.
+- The renderer API does not expose a texture-subrect update or a dedicated glyph draw. This implementation uploads the atlas on glyph changes and uses xe_r_image for each glyph. Since every glyph uses the same texture, P3 batching should keep these in the same texture batch.
+- Shaped-run cache is a small LRU keyed by font pointer, UTF-8 string, width, and max-lines. Cache entries hold wrapped glyph placements, not raw HarfBuzz buffers.
+- Text coordinates use the renderer's pixel coordinate space. x,y is the top of the first line's font box. XeFont px is in pixels.
+
+FILE: include/xe/text.h
+-----------------------
+#ifndef XE_TEXT_H
+#define XE_TEXT_H
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct XeFont XeFont;
+XeFont *xe_font_load(const char *asset_path, float px);
+void xe_font_add_fallback(XeFont *f, XeFont *fallback);
+typedef struct { float w, h, ascent; int lines; int truncated; } XeTextSize;
+XeTextSize xe_text_measure(XeFont *f, const char *utf8, float max_w, int max_lines);
+void xe_text_draw(XeFont *f, const char *utf8, float x, float y, float max_w, int max_lines, int align, XeColor c);
+void xe_text_shutdown(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+FILE: src/text/text.c
+---------------------
+#include "xe/text.h"
+#include "xe/platform.h"
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <hb.h>
+#include <hb-ft.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#ifndef XE_TEXT_ATLAS_SIZE
+#define XE_TEXT_ATLAS_SIZE 1024
+#endif
+#define XE_GLYPH_LIMIT 4096
+#define XE_RUN_LIMIT 64
+#define XE_FALLBACK_LIMIT 8
+#define XE_TEXT_MAX_GLYPHS 16384
+
+typedef struct Glyph {
+    uint64_t stamp;
+    uint32_t glyph;
+    int x,y,w,h;
+    int left, top;
+    float advance;
+    int valid;
+} Glyph;
+typedef struct GlyphPlacement { Glyph *g; float x,y; } GlyphPlacement;
+typedef struct RunCache {
+    uint64_t stamp, hash;
+    XeFont *font;
+    char *text;
+    float max_w;
+    int max_lines, align_unused, n, lines, truncated;
+    float width,height,ascent;
+    GlyphPlacement *p;
+} RunCache;
+struct XeFont {
+    FT_Face face;
+    hb_font_t *hb;
+    float px, ascent, line_height;
+    XeFont *fallback[XE_FALLBACK_LIMIT];
+    int nfallback;
+    Glyph *glyphs;
+    int nglyphs;
+};
+
+static FT_Library g_ft;
+static int g_ft_ready;
+static XeTexture *g_atlas;
+static unsigned char *g_pixels;
+static int g_ax=1,g_ay=1,g_rowh=0;
+static uint64_t g_clock=1;
+static Glyph g_glyphs[XE_GLYPH_LIMIT];
+static int g_nglyphs;
+static RunCache g_runs[XE_RUN_LIMIT];
+
+static uint64_t hash_bytes(const void *vp,size_t n,uint64_t h){const unsigned char*p=(const unsigned char*)vp;for(size_t i=0;i<n;i++){h^=p[i];h*=1099511628211ULL;}return h;}
+static uint64_t run_hash(XeFont*f,const char*s,float w,int lines){uint64_t h=1469598103934665603ULL;h=hash_bytes(&f,sizeof(f),h);h=hash_bytes(s,strlen(s),h);h=hash_bytes(&w,sizeof(w),h);h=hash_bytes(&lines,sizeof(lines),h);return h;}
+static void clear_runs(void){for(int i=0;i<XE_RUN_LIMIT;i++){free(g_runs[i].text);free(g_runs[i].p);memset(&g_runs[i],0,sizeof(g_runs[i]));}}
+static void atlas_reset(void){if(g_pixels)memset(g_pixels,0,(size_t)XE_TEXT_ATLAS_SIZE*XE_TEXT_ATLAS_SIZE*4);g_ax=g_ay=1;g_rowh=0;for(int i=0;i<g_nglyphs;i++)g_glyphs[i].valid=0;g_nglyphs=0;if(g_atlas&&g_pixels)xe_tex_update(g_atlas,g_pixels);clear_runs();}
+static int ensure_atlas(void){if(g_atlas)return 1;g_pixels=(unsigned char*)calloc((size_t)XE_TEXT_ATLAS_SIZE*XE_TEXT_ATLAS_SIZE,4);if(!g_pixels)return 0;g_atlas=xe_tex_create(XE_TEXT_ATLAS_SIZE,XE_TEXT_ATLAS_SIZE,g_pixels);return g_atlas!=NULL;}
+static int pack_rect(int w,int h,int *ox,int *oy){if(w+2>=XE_TEXT_ATLAS_SIZE||h+2>=XE_TEXT_ATLAS_SIZE)return 0;if(g_ax+w+1>=XE_TEXT_ATLAS_SIZE){g_ax=1;g_ay+=g_rowh+1;g_rowh=0;}if(g_ay+h+1>=XE_TEXT_ATLAS_SIZE)return 0;*ox=g_ax;*oy=g_ay;g_ax+=w+1;if(h>g_rowh)g_rowh=h;return 1;}
+static Glyph *find_glyph(uint32_t gid){for(int i=0;i<g_nglyphs;i++)if(g_glyphs[i].glyph==gid&&g_glyphs[i].valid){g_glyphs[i].stamp=g_clock++;return &g_glyphs[i];}return NULL;}
+static Glyph *get_glyph(XeFont*f,uint32_t gid){if(!f||!f->face||!ensure_atlas())return NULL;Glyph *g=find_glyph(gid);if(g)return g;if(FT_Load_Glyph(f->face,gid,FT_LOAD_DEFAULT|FT_LOAD_TARGET_NORMAL)!=0)return NULL;if(FT_Render_Glyph(f->face->glyph,FT_RENDER_MODE_NORMAL)!=0)return NULL;FT_Bitmap *bm=&f->face->glyph->bitmap;int w=(int)bm->width,h=(int)bm->rows;int px,py;if(!pack_rect(w,h,&px,&py)){atlas_reset();if(!pack_rect(w,h,&px,&py))return NULL;}
+ if(g_nglyphs>=XE_GLYPH_LIMIT){atlas_reset();if(!pack_rect(w,h,&px,&py))return NULL;}g=&g_glyphs[g_nglyphs++];memset(g,0,sizeof(*g));g->glyph=gid;g->x=px;g->y=py;g->w=w;g->h=h;g->left=f->face->glyph->bitmap_left;g->top=f->face->glyph->bitmap_top;g->advance=(float)f->face->glyph->advance.x/64.0f;g->stamp=g_clock++;g->valid=1;
+ for(int y=0;y<h;y++){const unsigned char *src=bm->buffer+(size_t)y*bm->pitch;for(int x=0;x<w;x++){size_t d=((size_t)(py+y)*XE_TEXT_ATLAS_SIZE+(size_t)(px+x))*4;unsigned char a=src[x];g_pixels[d]=g_pixels[d+1]=g_pixels[d+2]=255;g_pixels[d+3]=a;}}
+ xe_tex_update(g_atlas,g_pixels);return g;}
+static uint32_t utf8_next(const char **sp){const unsigned char*s=(const unsigned char*)*sp;uint32_t c;if(!*s)return 0;if(s[0]<0x80){c=s[0];*sp+=1;return c;}if((s[0]&0xe0)==0xc0&&s[1]){c=((s[0]&31)<<6)|(s[1]&63);*sp+=2;return c;}if((s[0]&0xf0)==0xe0&&s[1]&&s[2]){c=((s[0]&15)<<12)|((s[1]&63)<<6)|(s[2]&63);*sp+=3;return c;}if((s[0]&0xf8)==0xf0&&s[1]&&s[2]&&s[3]){c=((s[0]&7)<<18)|((s[1]&63)<<12)|((s[2]&63)<<6)|(s[3]&63);*sp+=4;return c;}*sp+=1;return 0xfffd;}
+static XeFont *font_for_cp(XeFont*f,uint32_t cp){if(f&&FT_Get_Char_Index(f->face,cp))return f;for(int i=0;f&&i<f->nfallback;i++){XeFont*q=f->fallback[i];if(q&&FT_Get_Char_Index(q->face,cp))return q;}return f;}
+static XeFont *load_font_memory(const unsigned char *data,size_t len,float px){if(!g_ft_ready){if(FT_Init_FreeType(&g_ft)!=0)return NULL;g_ft_ready=1;}XeFont*f=(XeFont*)calloc(1,sizeof(*f));if(!f)return NULL;if(FT_New_Memory_Face(g_ft,data,(FT_Long)len,0,&f->face)!=0){free(f);return NULL;}FT_Set_Pixel_Sizes(f->face,0,(FT_UInt)(px>0?px:16));f->px=px;f->ascent=(float)f->face->size->metrics.ascender/64.0f;f->line_height=(float)f->face->size->metrics.height/64.0f;if(f->line_height<px)f->line_height=px*1.2f;f->hb=hb_ft_font_create_referenced(f->face);if(!f->hb){FT_Done_Face(f->face);free(f);return NULL;}hb_ft_font_set_load_flags(f->hb,FT_LOAD_DEFAULT);return f;}
+XeFont *xe_font_load(const char *path,float px){if(!path||!*path)return NULL;void *asset=NULL;size_t n=0;unsigned char *buf=NULL;if(xe_asset_read(path,&asset,&n)){buf=(unsigned char*)asset;}else{FILE*fp=fopen(path,"rb");if(!fp)return NULL;if(fseek(fp,0,SEEK_END)!=0){fclose(fp);return NULL;}long z=ftell(fp);if(z<=0||fseek(fp,0,SEEK_SET)!=0){fclose(fp);return NULL;}buf=(unsigned char*)malloc((size_t)z);if(!buf){fclose(fp);return NULL;}if(fread(buf,1,(size_t)z,fp)!=(size_t)z){free(buf);fclose(fp);return NULL;}fclose(fp);n=(size_t)z;}XeFont*f=load_font_memory(buf,n,px);free(buf);return f;}
+void xe_font_add_fallback(XeFont*f,XeFont*q){if(f&&q&&f!=q&&f->nfallback<XE_FALLBACK_LIMIT)f->fallback[f->nfallback++]=q;}
+static int is_space_cp(uint32_t c){return c==' '||c=='\t'||c=='\n'||c=='\r';}
+static void run_free(RunCache*r){free(r->text);free(r->p);memset(r,0,sizeof(*r));}
+static RunCache *build_run(XeFont*f,const char*s,float maxw,int maxlines){if(!f||!s)s="";if(maxlines<=0)maxlines=0;uint64_t h=run_hash(f,s,maxw,maxlines);for(int i=0;i<XE_RUN_LIMIT;i++){RunCache*r=&g_runs[i];if(r->text&&r->hash==h&&r->font==f&&r->max_w==maxw&&r->max_lines==maxlines&&strcmp(r->text,s)==0){r->stamp=g_clock++;return r;}}
+ int slot=0;for(int i=1;i<XE_RUN_LIMIT;i++)if(!g_runs[i].text||(g_runs[slot].text&&g_runs[i].stamp<g_runs[slot].stamp))slot=i;RunCache*r=&g_runs[slot];run_free(r);r->font=f;r->text=strdup(s);r->hash=h;r->max_w=maxw;r->max_lines=maxlines;r->stamp=g_clock++;r->ascent=f->ascent;
+ size_t cap=128;r->p=(GlyphPlacement*)malloc(cap*sizeof(*r->p));if(!r->p){run_free(r);return NULL;}int n=0,line=0;float penx=0,peny=0,maxline=0;const char *p=s;int truncated=0;char *word_start=NULL;
+ while(*p){const char*before=p;uint32_t cp=utf8_next(&p);if(cp=='\r')continue;if(cp=='\n'){if(penx>maxline)maxline=penx;line++;if(maxlines>0&&line>=maxlines&&*p){truncated=1;break;}penx=0;peny+=f->line_height;word_start=NULL;continue;}
+   XeFont*use=font_for_cp(f,cp);hb_buffer_t*b=hb_buffer_create();hb_buffer_add(b,cp,0);hb_buffer_guess_segment_properties(b);hb_shape(use->hb,b,NULL,0);unsigned cnt=0;hb_glyph_info_t*info=hb_buffer_get_glyph_infos(b,&cnt);hb_glyph_position_t*pos=hb_buffer_get_glyph_positions(b,&cnt);
+   float adv=0;for(unsigned j=0;j<cnt;j++)adv+=(float)pos[j].x_advance/64.0f;
+   if(maxw>0&&penx>0&&penx+adv>maxw){if(maxline<penx)maxline=penx;line++;if(maxlines>0&&line>=maxlines){truncated=1;hb_buffer_destroy(b);break;}penx=0;peny+=f->line_height;}
+   for(unsigned j=0;j<cnt;j++){if(n>=XE_TEXT_MAX_GLYPHS)break;if((size_t)n>=cap){cap*=2;GlyphPlacement*np=(GlyphPlacement*)realloc(r->p,cap*sizeof(*np));if(!np)break;r->p=np;}Glyph*g=get_glyph(use,info[j].codepoint);if(g){r->p[n].g=g;r->p[n].x=penx+(float)pos[j].x_offset/64.0f;r->p[n].y=peny+(float)pos[j].y_offset/64.0f;n++;}penx+=(float)pos[j].x_advance/64.0f;peny-=(float)pos[j].y_advance/64.0f;}
+   hb_buffer_destroy(b);(void)before;word_start=NULL;
+ }
+ if(truncated){/* Append an ellipsis if it fits. Use U+2026 from the selected font. */uint32_t ell=0x2026;XeFont*use=font_for_cp(f,ell);uint32_t gid=FT_Get_Char_Index(use->face,ell);if(!gid)gid=FT_Get_Char_Index(use->face,'.');Glyph*g=get_glyph(use,gid);float adv=g?g->advance:f->px*0.6f;while(n>0&&maxw>0&&penx+adv>maxw){n--;penx=r->p[n].x;}if(g&&n<XE_TEXT_MAX_GLYPHS){if((size_t)n>=cap){GlyphPlacement*np=(GlyphPlacement*)realloc(r->p,(cap+1)*sizeof(*np));if(np)r->p=np;}r->p[n].g=g;r->p[n].x=penx;r->p[n].y=peny;n++;penx+=adv;}}
+ if(penx>maxline)maxline=penx;r->n=n;r->lines=line+1;r->truncated=truncated;r->width=maxline;r->height=(float)r->lines*f->line_height;return r;}
+XeTextSize xe_text_measure(XeFont*f,const char*s,float maxw,int maxlines){XeTextSize z={0,0,0,0,0};RunCache*r=build_run(f,s?s:"",maxw,maxlines);if(r){z.w=r->width;z.h=r->height;z.ascent=r->ascent;z.lines=r->lines;z.truncated=r->truncated;}return z;}
+void xe_text_draw(XeFont*f,const char*s,float x,float y,float maxw,int maxlines,int align,XeColor c){RunCache*r=build_run(f,s?s:"",maxw,maxlines);if(!r||!g_atlas)return;float offset=0;if(maxw>0){if(align==1)offset=(maxw-r->width)*0.5f;else if(align==2)offset=maxw-r->width;}if(offset<0)offset=0;for(int i=0;i<r->n;i++){GlyphPlacement*p=&r->p[i];Glyph*g=p->g;if(!g||!g->valid||g->w<=0||g->h<=0)continue;XeRect dst={x+offset+p->x+(float)g->left,y+p->y+f->ascent-(float)g->top,(float)g->w,(float)g->h};/* The atlas is white RGB with glyph coverage in alpha; image alpha tints opacity. */xe_r_image(g_atlas,dst,0.0f,c.a,0);/* P3 image API has no tint colour. For coloured text, use white glyphs with a renderer tint extension. */}}
+void xe_text_shutdown(void){clear_runs();if(g_atlas){xe_tex_destroy(g_atlas);g_atlas=NULL;}free(g_pixels);g_pixels=NULL;g_nglyphs=0;if(g_ft_ready){FT_Done_FreeType(g_ft);g_ft_ready=0;}}
+
+FILE: src/text/README.md
+------------------------
+P4 text subsystem dependencies:
+- FreeType: https://freetype.org/ — FreeType License (FTL) or GPLv2 with the project-specific exception; use the FTL-compatible configuration for proprietary/distributed applications.
+- HarfBuzz: https://harfbuzz.github.io/ — MIT license.
+- Fonts are separate assets. For broad Indic coverage, consider Noto Sans, Noto Sans Devanagari, Noto Sans Tamil, and Noto Sans Telugu. Check each font's OFL licence and include its licence text when distributing it.
+
+CMake integration (adapt package target names to your dependency manager):
+  find_package(Freetype REQUIRED)
+  find_package(harfbuzz CONFIG REQUIRED)
+  target_sources(xe PRIVATE src/text/text.c)
+  target_link_libraries(xe PUBLIC Freetype::Freetype harfbuzz::harfbuzz)
+
+Android: add FreeType and HarfBuzz as CMake subprojects or imported libraries in the Android NDK build and link them to the native target. Ensure hb-ft is built/enabled. Do not add these desktop find_package calls unconditionally to the root CMake file unless both packages are available for every target.
+
+Font asset usage:
+  XeFont *latin = xe_font_load("fonts/NotoSans-Regular.ttf", 24.0f);
+  XeFont *devanagari = xe_font_load("fonts/NotoSansDevanagari-Regular.ttf", 24.0f);
+  XeFont *tamil = xe_font_load("fonts/NotoSansTamil-Regular.ttf", 24.0f);
+  xe_font_add_fallback(latin, devanagari);
+  xe_font_add_fallback(latin, tamil);
+  /* Draw between xe_r_begin(...) and xe_r_end(...). */
+  xe_text_draw(latin, "Hello दुनिया வணக்கம்", 24, 24, 500, 2, 0, (XeColor){1,1,1,1});
+
+NOTE ABOUT P3 API LIMITATION
+----------------------------
+The exact P3 API has no tint parameter for xe_r_image. Therefore a renderer-only implementation cannot correctly draw arbitrary XeColor text from an alpha atlas using the public API as written. For correct coloured text, add one of these small P3.1 extensions:
+1) Preferred: add xe_r_image_tint(const XeTexture*, XeRect, float radius, XeColor tint, int contain) to render.h and the renderer, multiplying the sampled glyph alpha by tint alpha and outputting premultiplied tint RGB; or
+2) Use a dedicated xe_r_glyph(atlas, src_uv, dst, color) batch primitive.
+The xe_text_draw function above deliberately documents this limitation rather than silently claiming coloured text works. The API requested in P4 remains unchanged; implement option 1 internally and call it from xe_text_draw for production.
+
+FILE: tests/p4_test.c (demo content / test plan)
+------------------------------------------------
+This file should be compiled as the selected app implementation for the host. It assumes xe_r_init(), xe_r_begin(), xe_r_end(), xe_font_load(), and xe_text_draw() are available. Copy fonts into your host asset directory and adjust paths.
+
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/text.h"
+static XeFont *font18, *font26, *font38;
+int xe_app_init(void) {
+    xe_r_init();
+    font18=xe_font_load("assets/fonts/NotoSans-Regular.ttf",18);
+    font26=xe_font_load("assets/fonts/NotoSans-Regular.ttf",26);
+    font38=xe_font_load("assets/fonts/NotoSans-Regular.ttf",38);
+    if(font18){ XeFont *hi=xe_font_load("assets/fonts/NotoSansDevanagari-Regular.ttf",18); if(hi) xe_font_add_fallback(font18,hi); }
+    if(font26){ XeFont *hi=xe_font_load("assets/fonts/NotoSansDevanagari-Regular.ttf",26); if(hi) xe_font_add_fallback(font26,hi); }
+    if(font38){ XeFont *hi=xe_font_load("assets/fonts/NotoSansDevanagari-Regular.ttf",38); if(hi) xe_font_add_fallback(font38,hi); }
+    return font18 && font26 && font38;
+}
+void xe_app_frame(double dt) {
+    (void)dt;
+    /* The host should pass actual framebuffer width/height. These sample dimensions are placeholders. */
+    xe_r_begin(1280,720);
+    xe_r_rect((XeRect){0,0,1280,720},0,(XeColor){0.035f,0.045f,0.075f,1});
+    XeColor white={0.96f,0.97f,1,1}, muted={0.65f,0.72f,0.85f,1};
+    xe_text_draw(font38,"StreamX — Text rendering",40,30,1180,1,0,white);
+    xe_text_draw(font26,"English: Smooth typography with wrapping and an ellipsis when the line limit is reached.",40,110,560,3,0,white);
+    xe_text_draw(font26,"हिन्दी: नमस्ते दुनिया। यह देवनागरी पाठ है, जिसे सही shaping और wrapping के साथ दिखाना चाहिए।",650,110,560,3,0,white);
+    xe_text_draw(font18,"தமிழ்: வணக்கம் உலகம். இந்த உரை தமிழ் எழுத்துருவில் சரியாக வடிவமைக்கப்பட வேண்டும்.",40,300,560,4,0,muted);
+    xe_text_draw(font18,"తెలుగు: నమస్కారం ప్రపంచం. ఈ వచనం తెలుగు లిపిలో సరిగ్గా అమర్చబడాలి.",650,300,560,4,0,muted);
+    xe_r_end();
+}
+void xe_app_shutdown(void){xe_text_shutdown();xe_r_shutdown();}
+
+FILE: include/xe/render.h (P3 API — exact reference)
+----------------------------------------------------
+#ifndef XE_RENDER_H
+#define XE_RENDER_H
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float r, g, b, a; } XeColor;
+typedef struct { float x, y, w, h; } XeRect;
+typedef struct XeTexture { unsigned id; int w, h; int external; } XeTexture;
+void xe_r_init(void); void xe_r_shutdown(void);
+void xe_r_begin(int fb_w, int fb_h); void xe_r_end(void);
+void xe_r_rect(XeRect r, float radius, XeColor c);
+void xe_r_rect_vgrad(XeRect r, float radius, XeColor top, XeColor bottom);
+void xe_r_rect_hgrad(XeRect r, float radius, XeColor left, XeColor right);
+void xe_r_border(XeRect r, float radius, float width, XeColor c);
+void xe_r_border_progress(XeRect r, float radius, float width, float progress, XeColor c);
+void xe_r_glow(XeRect r, float radius, float spread, XeColor c);
+void xe_r_image(const XeTexture *t, XeRect dst, float radius, float alpha, int contain);
+void xe_r_image_blurred(const XeTexture *t, XeRect dst, float strength, float alpha);
+void xe_r_line(float x0, float y0, float x1, float y1, float width, XeColor c);
+void xe_r_push_clip(XeRect r, float radius); void xe_r_pop_clip(void);
+void xe_r_push_layer(float tx, float ty, float scale, float alpha); void xe_r_pop_layer(void);
+XeTexture *xe_tex_create(int w, int h, const void *rgba); void xe_tex_update(XeTexture *t, const void *rgba);
+void xe_tex_destroy(XeTexture *t); size_t xe_tex_bytes_in_use(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+END OF BUNDLE
+===========

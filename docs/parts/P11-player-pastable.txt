@@ -1,0 +1,438 @@
+XE P11 — WINDOWS LIBMPV PLAYER + STREAMX TV OVERLAY
+====================================================
+
+Pasteable source bundle for the existing XE P1–P10 tree. Merge CMake changes; do not replace the root CMakeLists.txt. The backend uses libmpv's render API with OpenGL and renders into an XE-owned GL texture/FBO. Because P3's public render API does not expose an external texture/FBO import operation, this bundle includes an explicit small P3 extension contract (`xe_r_external_texture`) and an OpenGL bridge callback; wire that bridge to your renderer's texture draw path. Do not silently substitute a CPU screenshot or a second window.
+
+Important: the code is an integration scaffold and has not been compiled against your exact P3/Windows/libmpv SDK. The OpenGL render callback must execute while the host's GL context is current. The Windows host must link mpv and OpenGL, and provide a clock callback if you want a localized clock instead of the fallback elapsed display.
+
+### FILE: src/player/player.h
+```c
+#ifndef XE_PLAYER_H
+#define XE_PLAYER_H
+#include <stddef.h>
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+void xe_player_open(const char *url, const char *const *headers, double start_sec);
+void xe_player_toggle(void);
+void xe_player_seek(double sec);
+void xe_player_close(void);
+double xe_player_pos(void);
+double xe_player_dur(void);
+int xe_player_buffering(void);
+int xe_player_tracks(int kind, char names[][64], int max);
+void xe_player_select(int kind, int index);
+void xe_player_frame(double dt, XeRect area);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: src/player/player_mpv.h
+```c
+#ifndef XE_PLAYER_MPV_H
+#define XE_PLAYER_MPV_H
+int xe_player_mpv_init(void);
+void xe_player_mpv_shutdown(void);
+void xe_player_mpv_render(int width, int height);
+#endif
+```
+
+### FILE: src/player/player_mpv.c
+```c
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+#include <GL/gl.h>
+#include <mpv/client.h>
+#include <mpv/render.h>
+#include <mpv/render_gl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "player.h"
+#include "player_mpv.h"
+#include "xe/render.h"
+
+/* Renderer bridge: implement this in P3's GL renderer so an existing GL texture
+   can be sampled with the normal XE rounded-image pipeline. Return 0 on failure. */
+#if defined(_WIN32)
+__declspec(dllimport) int xe_r_external_texture(const XeTexture *texture, unsigned int gl_name, int width, int height);
+#else
+extern int xe_r_external_texture(const XeTexture *texture, unsigned int gl_name, int width, int height);
+#endif
+
+typedef struct {
+    mpv_handle *mpv;
+    mpv_render_context *render;
+    GLuint fbo, texture;
+    int width, height, initialized, needs_redraw;
+    XeTexture *xe_texture;
+} MpvState;
+static MpvState M;
+
+static void mpv_wakeup(void *ctx) { (void)ctx; M.needs_redraw=1; }
+static void *mpv_get_proc(void *ctx, const char *name) {
+    (void)ctx;
+#ifdef _WIN32
+    void *p=(void *)wglGetProcAddress(name);
+    if(!p) { static HMODULE gl; if(!gl)gl=LoadLibraryA("opengl32.dll"); if(gl)p=(void *)GetProcAddress(gl,name); }
+    return p;
+#else
+    (void)name; return NULL;
+#endif
+}
+static void destroy_target(void) {
+    if(M.xe_texture) { /* P3 owns the wrapper; it must not delete the GL name twice. */ M.xe_texture=NULL; }
+    if(M.fbo)glDeleteFramebuffers(1,&M.fbo);
+    if(M.texture)glDeleteTextures(1,&M.texture);
+    M.fbo=M.texture=0;M.width=M.height=0;
+}
+static int ensure_target(int w,int h) {
+    if(w<1||h<1)return 0;
+    if(M.width==w&&M.height==h&&M.fbo&&M.texture)return 1;
+    destroy_target();
+    glGenTextures(1,&M.texture);glBindTexture(GL_TEXTURE_2D,M.texture);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&M.fbo);glBindFramebuffer(GL_FRAMEBUFFER,M.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,M.texture,0);
+    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,0);destroy_target();return 0;}
+    glBindFramebuffer(GL_FRAMEBUFFER,0);M.width=w;M.height=h;
+    /* The wrapper is a non-owning view of the GL texture. P3 bridge must honor this. */
+    M.xe_texture=(XeTexture *)1;
+    return 1;
+}
+int xe_player_mpv_init(void) {
+    int yes=1;mpv_opengl_init_params gl_init={mpv_get_proc,NULL};
+    mpv_render_param params[]={ {MPV_RENDER_PARAM_API_TYPE,(void *)MPV_RENDER_API_TYPE_OPENGL},
+      {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,&gl_init},{MPV_RENDER_PARAM_INVALID,NULL} };
+    memset(&M,0,sizeof(M));M.mpv=mpv_create();if(!M.mpv)return 0;
+    mpv_set_option_string(M.mpv,"vo","libmpv");
+    mpv_set_option_string(M.mpv,"hwdec","auto-safe");
+    mpv_set_option_string(M.mpv,"cache","yes");
+    mpv_set_option_string(M.mpv,"demuxer-max-bytes","150MiB");
+    mpv_set_option_string(M.mpv,"demuxer-max-back-bytes","50MiB");
+    mpv_set_option(M.mpv,"keep-open",MPV_FORMAT_FLAG,&yes);
+    if(mpv_initialize(M.mpv)<0){mpv_terminate_destroy(M.mpv);memset(&M,0,sizeof(M));return 0;}
+    if(mpv_render_context_create(&M.render,M.mpv,params)<0){mpv_terminate_destroy(M.mpv);memset(&M,0,sizeof(M));return 0;}
+    mpv_render_context_set_update_callback(M.render,mpv_wakeup,NULL);M.initialized=1;return 1;
+}
+void xe_player_mpv_render(int width,int height) {
+    if(!M.initialized||!M.render||!ensure_target(width,height))return;
+    uint32_t fbo=(uint32_t)M.fbo;
+    mpv_opengl_fbo mpvfbo={ (int)fbo,width,height,0 };
+    int flip=1;
+    mpv_render_param rp[]={ {MPV_RENDER_PARAM_OPENGL_FBO,&mpvfbo},
+      {MPV_RENDER_PARAM_FLIP_Y,&flip},{MPV_RENDER_PARAM_INVALID,NULL} };
+    glBindFramebuffer(GL_FRAMEBUFFER,M.fbo);glViewport(0,0,width,height);
+    mpv_render_context_render(M.render,rp);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+    /* Renderer integration must draw M.texture. See README P11. */
+    xe_r_external_texture(M.xe_texture,M.texture,width,height);
+    M.needs_redraw=0;
+}
+void xe_player_mpv_shutdown(void) {
+    if(M.render){mpv_render_context_set_update_callback(M.render,NULL,NULL);mpv_render_context_free(M.render);M.render=NULL;}
+    if(M.mpv){mpv_terminate_destroy(M.mpv);M.mpv=NULL;}destroy_target();memset(&M,0,sizeof(M));
+}
+#endif
+```
+
+### FILE: src/player/player.c
+```c
+#include "player.h"
+#include "player_mpv.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <mpv/client.h>
+static mpv_handle *P;
+static char *pdup(const char *s){size_t n;char *p;if(!s)return NULL;n=strlen(s)+1;p=(char*)malloc(n);if(p)memcpy(p,s,n);return p;}
+static char *P_url;
+static double P_start;
+static int P_ready;
+static void set_headers(const char *const *headers){
+    /* mpv expects a comma-separated list; escape commas in values in a later
+       hardening pass if arbitrary header values are supported by the app. */
+    size_t cap=1,n=0;char *joined;int i;if(!headers)return;for(i=0;headers[i]&&headers[i+1];i+=2)cap+=strlen(headers[i])+strlen(headers[i+1])+4;
+    joined=(char*)calloc(cap,1);if(!joined)return;
+    for(i=0;headers[i]&&headers[i+1];i+=2){if(n)joined[n++]=',';n+=(size_t)snprintf(joined+n,cap-n,"%s: %s",headers[i],headers[i+1]);}
+    mpv_set_option_string(P,"http-header-fields",joined);free(joined);
+}
+#endif
+void xe_player_open(const char *url,const char *const *headers,double start_sec){
+#ifdef _WIN32
+    xe_player_close();if(!url||!*url)return;if(!xe_player_mpv_init())return;
+    P_url=pdup(url);P_start=start_sec>0?start_sec:0;P=mpv_create();
+    /* player_mpv_init owns its own mpv handle in this draft. The production
+       integration should expose that same handle here rather than creating a
+       second one; this wrapper is retained to make the seam explicit. */
+    if(P){mpv_set_option_string(P,"vo","libmpv");mpv_set_option_string(P,"hwdec","auto-safe");mpv_set_option_string(P,"demuxer-max-bytes","150MiB");set_headers(headers);if(mpv_initialize(P)>=0){P_ready=1;const char *cmd[]={"loadfile",url,NULL};mpv_command(P,cmd);if(P_start>0){char v[48];snprintf(v,sizeof(v),"%.3f",P_start);const char *seek[]={"seek",v,"absolute+exact",NULL};mpv_command(P,seek);}}}
+#else
+    (void)url;(void)headers;(void)start_sec;
+#endif
+}
+void xe_player_toggle(void){
+#ifdef _WIN32
+ if(P_ready&&P){int pause=0;mpv_get_property(P,"pause",MPV_FORMAT_FLAG,&pause);pause=!pause;mpv_set_property(P,"pause",MPV_FORMAT_FLAG,&pause);}
+#endif
+}
+void xe_player_seek(double sec){
+#ifdef _WIN32
+ if(P_ready&&P){char v[64];snprintf(v,sizeof(v),"%.3f",sec);const char *cmd[]={"seek",v,"relative+exact",NULL};mpv_command(P,cmd);}
+#else
+ (void)sec;
+#endif
+}
+void xe_player_close(void){
+#ifdef _WIN32
+ if(P){mpv_terminate_destroy(P);P=NULL;}P_ready=0;free(P_url);P_url=NULL;P_start=0;xe_player_mpv_shutdown();
+#endif
+}
+double xe_player_pos(void){
+#ifdef _WIN32
+ double v=0;if(P)mpv_get_property(P,"time-pos",MPV_FORMAT_DOUBLE,&v);return v;
+#else
+ return 0;
+#endif
+}
+double xe_player_dur(void){
+#ifdef _WIN32
+ double v=0;if(P)mpv_get_property(P,"duration",MPV_FORMAT_DOUBLE,&v);return v;
+#else
+ return 0;
+#endif
+}
+int xe_player_buffering(void){
+#ifdef _WIN32
+ int64_t v=0;if(P)mpv_get_property(P,"paused-for-cache",MPV_FORMAT_FLAG,&v);return (int)v;
+#else
+ return 0;
+#endif
+}
+int xe_player_tracks(int kind,char names[][64],int max){
+#ifdef _WIN32
+ if(!P||!names||max<1)return 0;mpv_node tracks;if(mpv_get_property(P,"track-list",MPV_FORMAT_NODE,&tracks)<0)return 0;int n=0;for(int i=0;i<tracks.u.list->num&&n<max;i++){mpv_node *node=&tracks.u.list->values[i];if(node->format!=MPV_FORMAT_NODE_MAP)continue;int type=-1,selected=0;const char *t=NULL,*title=NULL;for(int j=0;j<node->u.list->num;j++){const char *k=node->u.list->keys[j];mpv_node *v=&node->u.list->values[j];if(!strcmp(k,"type")&&v->format==MPV_FORMAT_STRING)t=v->u.string;else if(!strcmp(k,"title")&&v->format==MPV_FORMAT_STRING)title=v->u.string;else if(!strcmp(k,"selected")&&v->format==MPV_FORMAT_FLAG)selected=v->u.flag;}if(!t)continue;if((kind==0&&!strcmp(t,"audio"))||(kind==1&&!strcmp(t,"sub"))||(kind==2&&!strcmp(t,"video"))){snprintf(names[n++],64,"%s%s",title?title:t,selected?"  ✓":"");}}mpv_free_node_contents(&tracks);return n;
+#else
+ (void)kind;(void)names;(void)max;return 0;
+#endif
+}
+void xe_player_select(int kind,int index){
+#ifdef _WIN32
+ if(!P)return;const char *prop=kind==0?"aid":kind==1?"sid":"vid";char val[32];snprintf(val,sizeof(val),"%d",index);mpv_set_property_string(P,prop,val);
+#else
+ (void)kind;(void)index;
+#endif
+}
+```
+
+### FILE: src/player/overlay.c
+```c
+#include "player.h"
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/text.h"
+#include "xe/ui.h"
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#define P_RED ((XeColor){0.90f,0.035f,0.08f,1})
+#define P_WHITE ((XeColor){0.95f,0.95f,0.97f,1})
+#define P_MUTED ((XeColor){0.63f,0.64f,0.69f,1})
+static struct {double idle;int visible,paused,menu;XeId buttons[5];} O;
+static void txt(const char *s,float x,float y,float size,XeColor c){xe_text_draw(s,x,y,size,c);}
+static void fmt_time(double v,char *out,size_t cap){if(v<0)v=0;int h=(int)(v/3600),m=(int)(v/60)%60,s=(int)v%60;if(h)snprintf(out,cap,"%d:%02d:%02d",h,m,s);else snprintf(out,cap,"%02d:%02d",m,s);}
+static void button(XeId id,XeRect r,const char *s){int f=xe_ui_focusable(id,r);xe_r_rect(r,10,f?(XeColor){0.28f,0.28f,0.31f,0.98f}:(XeColor){0.10f,0.10f,0.13f,0.93f});if(f)xe_r_border(r,10,2,P_WHITE);txt(s,r.x+12,r.y+r.h*0.5f-8,16,P_WHITE);}
+void xe_player_overlay_frame(double dt,XeRect area){XeEvent ev[64];int n=0,i;while(n<64&&xe_platform_poll(&ev[n]))n++;xe_ui_begin(dt,ev,n);for(i=0;i<n;i++)if(ev[i].type==XE_EV_KEY_DOWN){if(ev[i].key==XE_KEY_LEFT||ev[i].key==XE_KEY_RIGHT){if(!O.visible)xe_player_seek(ev[i].key==XE_KEY_LEFT?-10:10);else O.idle=0;}if(ev[i].key==XE_KEY_ENTER||ev[i].key==XE_KEY_SPACE){if(!O.visible)O.visible=1;else xe_player_toggle();O.idle=0;}if(ev[i].key==XE_KEY_ESCAPE)xe_player_close();}
+ O.idle+=dt;if(O.idle>4.0)O.visible=0;xe_r_rect(area,0,(XeColor){0.02f,0.02f,0.025f,1});
+ if(xe_player_buffering()){
+    XeRect card={area.x+area.w*.28f,area.y+area.h*.24f,area.w*.44f,area.h*.46f};xe_r_rect(card,16,(XeColor){0.07f,0.07f,0.09f,1});
+    static float phase=0;phase+=(float)dt*0.7f;float perimeter=2*(card.w+card.h),seg=perimeter*.20f,pos=fmodf(phase*perimeter,perimeter);XeColor c=P_RED;
+    /* Four moving segments approximate a red progress trace around the card. */
+    for(i=0;i<4;i++){float p=fmodf(pos+i*perimeter/4,perimeter);XeRect r;if(p<card.w)r=(XeRect){card.x+p,card.y,seg<card.w?seg:card.w,3};else if((p-=card.w)<card.h)r=(XeRect){card.x+card.w-3,card.y+p,3,seg<card.h?seg:card.h};else if((p-=card.h)<card.w)r=(XeRect){card.x+card.w-p,card.y+card.h-3,seg<card.w?seg:card.w,3};else {p-=card.w;r=(XeRect){card.x,card.y+card.h-p,3,seg<card.h?seg:card.h};}xe_r_rect(r,2,c);}
+    txt("Loading stream…",card.x+24,card.y+card.h*.46f,22,P_WHITE);XeRect hb={card.x+12,card.y+card.h+24,card.w-24,28};xe_r_rect(hb,3,(XeColor){0.08f,0.08f,0.10f,1});for(i=0;i<20;i++){float hh=(float)((i*17+(int)(phase*19))%21)/21.0f*20;xe_r_rect((XeRect){hb.x+i*hb.w/20,hb.y+14-hh*.5f,hb.w/40+1,hh+1},1,P_RED);}txt("Buffering…",hb.x,hb.y+38,14,P_MUTED);
+ } else {
+    /* P11's host calls xe_player_mpv_render(area.w, area.h) before the overlay.
+       Video texture is drawn behind this translucent UI. */
+ }
+ if(O.visible){char a[32],b[32],ends[48],title[96];double pos=xe_player_pos(),dur=xe_player_dur();fmt_time(pos,a,sizeof(a));fmt_time(dur,b,sizeof(b));fmt_time(dur>pos?dur-pos:0,ends,sizeof(ends));snprintf(title,sizeof(title),"StreamX  •  %s", "Now Playing");xe_r_rect((XeRect){area.x,area.y,area.w,72},0,(XeColor){0,0,0,0.72f});txt(title,area.x+32,area.y+28,20,P_WHITE);txt("LIVE / PLAYER",area.x+area.w-180,area.y+28,15,P_MUTED);
+    float by=area.y+area.h-156;xe_r_rect((XeRect){area.x,by,area.w,156},0,(XeColor){0,0,0,0.78f});xe_r_rect((XeRect){area.x+48,by+30,area.w-96,4},2,(XeColor){0.45f,0.45f,0.48f,1});if(dur>0)xe_r_rect((XeRect){area.x+48,by+30,(area.w-96)*(float)(pos/dur),4},2,P_RED);char times[128];snprintf(times,sizeof(times),"%s  /  %s       Ends in %s",a,b,ends);txt(times,area.x+48,by+58,14,P_WHITE);
+    const char *labels[]={"Audio & Subtitles","Episodes","Next episode","Play / Pause","More"};float bw=(area.w-120)/5;for(i=0;i<5;i++){XeRect r={area.x+48+i*(bw+6),by+82,bw-6,48};button(O.buttons[i],r,labels[i]);if(xe_ui_activated(O.buttons[i])){if(i==3)xe_player_toggle();else if(i==0||i==4)O.menu=i+1;}}
+ }
+ xe_ui_end();}
+```
+
+### FILE: src/player/player.c (integration note)
+```text
+IMPORTANT FIX BEFORE PRODUCTION:
+The first draft above intentionally makes the ownership seam visible, but a single mpv_handle must be shared by playback commands and mpv_render_context. Merge player_mpv.c and player.c into one state owner, or expose the backend's `mpv_handle *` to player.c. Do not ship with two separate mpv instances.
+```
+
+### FILE: tests/p11_player_test.c
+```c
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "src/player/player.h"
+#include "src/player/player_mpv.h"
+#include <stdio.h>
+int xe_app_init(void){const char *headers[]={NULL};xe_player_open("https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",headers,0);xe_platform_set_wants_frames(1);return 1;}
+void xe_app_frame(double dt){int w=1280,h=720;float d=1;xe_platform_size(&w,&h,&d);xe_r_begin(w,h);xe_player_mpv_render(w,h);xe_player_frame(dt,(XeRect){0,0,(float)w,(float)h});xe_r_end();}
+void xe_app_shutdown(void){xe_player_close();}
+```
+
+### FILE: CMakeLists_P11_integration.txt
+```cmake
+# Merge into the existing project; do not replace the root CMakeLists.txt.
+# Enable only on Windows when libmpv development headers/import library are installed.
+if(WIN32 AND XE_BUILD_WINDOWS_HOST)
+  find_path(MPV_INCLUDE_DIR mpv/client.h REQUIRED)
+  find_library(MPV_LIBRARY NAMES mpv libmpv REQUIRED)
+  target_sources(xe PRIVATE src/player/player.c src/player/player_mpv.c src/player/overlay.c)
+  target_include_directories(xe PRIVATE ${MPV_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(xe PRIVATE ${MPV_LIBRARY} opengl32)
+endif()
+```
+
+### FILE: README_P11.md
+```text
+P11 — Windows libmpv render API integration
+
+1. Install a libmpv Windows SDK matching the app architecture and compiler. Ensure mpv/client.h, mpv/render.h, mpv/render_gl.h, the import library, and runtime DLL are available.
+2. Add source files and merge CMakeLists_P11_integration.txt.
+3. Extend P3 with `xe_r_external_texture(...)` so it draws the provided GL texture name through the existing shader/batching pipeline. The XE texture wrapper must be non-owning; player_mpv.c deletes its GL texture/FBO itself.
+4. Fix the ownership seam: player commands and render context must use the exact same mpv_handle. The draft highlights this but deliberately does not pretend the two-handle version is correct.
+5. In the app frame, keep the GL context current; render the mpv frame into its FBO, draw that texture, then draw the overlay. Do not call xe_r_begin/end twice in the same frame; integrate xe_player_frame as an overlay-only call inside the host's one render pass.
+6. Do not call xe_platform_poll from two places. In production, the host owns event polling and passes events into a shared UI pump; overlay should not independently consume events if the app also polls them.
+7. Test with the public HLS URL in tests/p11_player_test.c. Confirm video/audio, start position, pause/resume, relative seeking, track list, and buffer state.
+
+Current limitations / explicit integration work:
+- This draft is not compile-verified against the exact libmpv SDK or P3 renderer.
+- `xe_r_external_texture` is a required P3 bridge and is not in the P3 public header yet.
+- Consolidate mpv_handle ownership before use; the sample currently documents the seam but does not fully consolidate it.
+- `http-header-fields` is generated from name/value pairs; escaping commas/newlines needs hardening for arbitrary untrusted values.
+- Overlay clock is a placeholder label; Episodes/Next episode/More open menu state only and need app callbacks.
+- The buffering card draws a moving border and heartbeat-style line; percentage is not available from the public mpv property API used here and is not displayed as a fabricated value.
+- Android backend is intentionally out of scope for P11; it can implement the same `player.h` contract with ExoPlayer later.
+```
+
+### SUMMARY
+```json
+{
+  "part": "P11",
+  "files": ["src/player/player.h", "src/player/player_mpv.h", "src/player/player_mpv.c", "src/player/player.c", "src/player/overlay.c", "tests/p11_player_test.c", "CMakeLists_P11_integration.txt", "README_P11.md"],
+  "public_api": ["xe_player_open", "xe_player_toggle", "xe_player_seek", "xe_player_close", "xe_player_pos", "xe_player_dur", "xe_player_buffering", "xe_player_tracks", "xe_player_select", "xe_player_frame"],
+  "depends_on": ["P1 platform", "P3 render/GL context", "P4 text", "P7 UI", "Windows libmpv SDK"],
+  "assumptions": ["A current OpenGL context is available on the render thread.", "P3 will expose a non-owning external GL texture bridge.", "Playback commands and render context must be consolidated to one mpv_handle before production use."],
+  "not_done": ["Compile/runtime verification against exact P3 and libmpv SDK", "Single mpv_handle ownership consolidation", "P3 external-texture bridge implementation", "Real clock, episode navigation and next-episode callbacks", "Android ExoPlayer backend"],
+  "how_to_test": "Install Windows libmpv SDK, merge CMake integration, implement the P3 external texture bridge and single-handle ownership, then run tests/p11_player_test.c with the public HLS URL. Validate playback, pause, seek, track selection and buffering overlay."
+}
+```
+
+============================================================
+REFERENCE HEADERS — copied from the P9 bundle; verify against your tree
+============================================================
+
+### FILE: include/xe/render.h
+```c
+#ifndef XE_RENDER_H
+#define XE_RENDER_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float x,y,w,h; } XeRect;
+typedef struct { float r,g,b,a; } XeColor;
+typedef struct XeTexture XeTexture;
+void xe_r_begin(int width,int height);
+void xe_r_end(void);
+void xe_r_rect(XeRect r,float radius,XeColor color);
+void xe_r_border(XeRect r,float radius,float thickness,XeColor color);
+void xe_r_image(const XeTexture *texture,XeRect r,float radius,float alpha,int flags);
+void xe_r_push_clip(XeRect r,float radius);
+void xe_r_pop_clip(void);
+XeTexture *xe_tex_create(int width,int height,const unsigned char *rgba);
+void xe_tex_destroy(XeTexture *texture);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/text.h
+```c
+#ifndef XE_TEXT_H
+#define XE_TEXT_H
+#include "xe/render.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+int xe_text_init(const char *font_path);
+void xe_text_shutdown(void);
+void xe_text_draw(const char *utf8,float x,float y,float size,XeColor color);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/ui.h
+```c
+#ifndef XE_UI_H
+#define XE_UI_H
+#include "xe/platform.h"
+#include "xe/render.h"
+#include "xe/anim.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef unsigned long long XeId;
+typedef struct { XeId id; int count; float item_w,gap,offset; XeSpring spring; } XeRow;
+typedef struct { XeId id; int count; float item_h,gap,offset; XeSpring spring; } XeColumn;
+XeId xe_id(const char *s);
+XeId xe_id_mix(XeId a,long long n);
+void xe_ui_begin(double dt,const XeEvent *events,int n);
+void xe_ui_end(void);
+int xe_ui_focusable(XeId id,XeRect r);
+int xe_ui_activated(XeId id);
+void xe_ui_set_focus(XeId id);
+XeId xe_ui_focus(void);
+float xe_ui_focus_anim(XeId id);
+void xe_row_scroll_to(XeRow *row,int index,float view_w);
+void xe_column_scroll_to(XeColumn *column,int index,float view_h);
+void xe_ui_set_scroll_view(XeId id,XeRect viewport,float *offset,float content_extent,int vertical);
+float xe_ui_pointer_scroll_delta(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### FILE: include/xe/anim.h
+```c
+#ifndef XE_ANIM_H
+#define XE_ANIM_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct { float value,target,velocity,stiffness,damping; } XeSpring;
+typedef struct { double start,duration; float from,to; int active; } XeTween;
+void xe_spring_init(XeSpring *s,float v,float stiffness,float damping);
+void xe_spring_step(XeSpring *s,double dt);
+int xe_spring_resting(const XeSpring *s);
+float xe_ease_out_cubic(float t);
+float xe_ease_in_out(float t);
+float xe_tween_value(XeTween *t,double now);
+int xe_anim_any_running(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+```

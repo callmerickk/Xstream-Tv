@@ -1,0 +1,167 @@
+Worked for 2m 45s
+
+P2 — Android Host (TV + Phone)
+
+I've packaged P2 with the P1 foundation included, so you can continue working with one repository rather than combining two separate ZIP files.
+
+📦 Download the repository
+
+Download XE P2 — Android Host + P1 Foundation
+
+1. What's included
+
+File	Purpose
+
+xehost/build.gradle.kts	Android library module configuration, NDK ABIs, and CMake integration
+xehost/src/main/AndroidManifest.xml	Android activity declarations
+XeView.kt	GLES 2.0 GLSurfaceView, frame timing, and render requests
+XeActivity.kt	Full-screen immersive host, keyboard and remote input, lifecycle handling
+XeBridge.kt	Kotlin callbacks for browser, keyboard, and toast operations
+xehost/src/main/cpp/xe_jni.c	JNI bridge and native platform functions
+xehost/src/main/cpp/xe_android.h	Native Android helper declarations
+xehost/src/main/cpp/xe_demo.c	Native demo application with D-pad colour changes
+xehost/PLATFORM_API_REFERENCE.h	Copy of the P1 platform API
+xehost/README.md	Android module setup and integration instructions
+
+
+The repository also retains the original P1 Windows host, common platform implementation, test, and root CMake configuration.
+
+2. Android input mappings
+
+Android input	XE key
+
+D-pad Up	XE_KEY_UP
+D-pad Down	XE_KEY_DOWN
+D-pad Left	XE_KEY_LEFT
+D-pad Right	XE_KEY_RIGHT
+Enter / D-pad Center	XE_KEY_OK
+Back / Escape	XE_KEY_BACK
+Menu	XE_KEY_MENU
+Media Play/Pause	XE_KEY_PLAYPAUSE
+Media Fast Forward	XE_KEY_FF
+Media Rewind	XE_KEY_RW
+Search	XE_KEY_SEARCH
+
+
+Touch input is translated into pointer events, and scroll input generates scroll events.
+
+3. Rendering architecture
+
+The host uses the following rendering arrangement:
+
+OpenGL ES 2.0: Creates an RGBA8888 EGL surface.
+
+Context preservation: Requests EGL context preservation across pauses.
+
+Frame timing: Calculates elapsed time and passes it to nativeFrame(dt).
+
+On-demand rendering: Uses RENDERMODE_WHEN_DIRTY and exposes requestRenderFromApp().
+
+Continuous animation: Checks xe_platform_wants_frames() after each native frame and requests another frame when needed.
+
+Lifecycle events: Sends pause and resume events to the native event queue.
+
+APK assets: Provides xe_asset_read() for loading bundled files into native memory.
+
+Kotlin callbacks: Provides xe_android_call_void() for invoking static XeBridge methods with string arguments.
+
+
+The demo changes its background colour when you press the D-pad.
+
+4. Build configuration
+
+The Android library is configured for:
+
+Minimum Android SDK: 21
+
+ABIs: armeabi-v7a, arm64-v8a
+
+Kotlin and JNI C
+
+Root CMakeLists.txt
+
+Android OpenGL ES 2.0
+
+
+To integrate the module into an existing Android Gradle project, add it to settings.gradle.kts:
+
+include(":xehost")
+
+Then add the dependency to your application module:
+
+dependencies {
+    implementation(project(":xehost"))
+}
+
+The project needs a compatible Android Gradle Plugin, Kotlin Android plugin, Android SDK, NDK, and CMake 3.22.1.
+
+5. Verification status
+
+The updated root CMake configuration successfully builds the common xe static library in the available environment.
+
+The Android APK has not yet been built or run. The JNI integration, Kotlin compilation, device rendering, and remote-control input therefore still require Android build and runtime verification.
+
+One implementation detail to keep in mind: XeBridge.showKeyboard() currently requests the system keyboard for the focused view. A dedicated text-input view and proper IME integration may be needed for reliable text entry through the Android keyboard.
+
+
+---
+
+P1 platform API reference
+
+As requested, here is the original P1 include/xe/platform.h interface. The repository also contains this header at xehost/PLATFORM_API_REFERENCE.h.
+
+#ifndef XE_PLATFORM_H
+#define XE_PLATFORM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    XE_KEY_NONE, XE_KEY_UP, XE_KEY_DOWN, XE_KEY_LEFT, XE_KEY_RIGHT, XE_KEY_OK,
+    XE_KEY_BACK, XE_KEY_MENU, XE_KEY_PLAYPAUSE, XE_KEY_FF, XE_KEY_RW, XE_KEY_SEARCH
+} XeKey;
+
+typedef enum {
+    XE_EV_NONE, XE_EV_KEY_DOWN, XE_EV_KEY_UP, XE_EV_TEXT, XE_EV_POINTER_DOWN,
+    XE_EV_POINTER_MOVE, XE_EV_POINTER_UP, XE_EV_SCROLL, XE_EV_RESIZE, XE_EV_PAUSE,
+    XE_EV_RESUME, XE_EV_QUIT
+} XeEventType;
+
+typedef struct {
+    XeEventType type;
+    XeKey key;
+    int repeat;
+    unsigned codepoint;
+    float x, y, dx, dy;
+    int w, h;
+} XeEvent;
+
+/* Hosts publish events; the engine drains them once per frame. Thread-safe. */
+void xe_platform_push_event(const XeEvent *ev);
+int xe_platform_poll(XeEvent *out); /* 0 = empty, 1 = event returned */
+
+double xe_time_now(void); /* monotonic seconds */
+void xe_platform_set_size(int w, int h, float density);
+void xe_platform_size(int *w, int *h, float *density);
+void xe_platform_set_dirs(const char *data_dir, const char *cache_dir);
+const char *xe_platform_data_dir(void);
+const char *xe_platform_cache_dir(void);
+void xe_log(int level, const char *fmt, ...); /* 0 debug, 1 info, 2 warn, 3 error */
+
+/* Implemented by the application. A host calls these at lifecycle boundaries. */
+int xe_app_init(void);
+void xe_app_frame(double dt);
+void xe_app_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+P2 extends this API with two frame-control functions:
+
+int xe_platform_wants_frames(void);
+void xe_platform_set_wants_frames(int wants_frames);
+
+Next milestone: Build the Android library, install the demo on an Android phone or TV, and verify D-pad navigation, lifecycle events, and GLES rendering before proceeding to P3.

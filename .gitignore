@@ -1,0 +1,6 @@
+build/
+out/
+vcpkg-cache/
+vcpkg_installed/
+*.user
+.vs/
